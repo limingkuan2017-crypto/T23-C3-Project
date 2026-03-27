@@ -7,8 +7,8 @@ Expected layout:
 
 ```text
 third_party/
-├─ ingenic_t23_sdk/
-└─ vendor_reference/
+|-- ingenic_t23_sdk/
+\-- vendor_reference/
 ```
 
 ## Why These Are Not Committed
