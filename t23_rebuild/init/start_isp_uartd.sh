@@ -38,7 +38,22 @@ killall login 2>/dev/null || true
 # 给串口从“人机交互模式”切换到“协议通道模式”一点缓冲时间。
 sleep 1
 
-echo "start_isp_uartd.sh: launching /system/bin/t23_isp_uartd"
-echo "start_isp_uartd.sh: after this point, reopen the UART from the browser UI"
+killall t23_isp_uartd 2>/dev/null || true
 
-exec /system/bin/t23_isp_uartd --port "${UART_DEV}" --baud "${UART_BAUD}"
+echo "start_isp_uartd.sh: launching /system/bin/t23_isp_uartd in background"
+echo "start_isp_uartd.sh: log file -> /tmp/isp_uartd.log"
+echo "start_isp_uartd.sh: pid file -> /tmp/isp_uartd.pid"
+echo "start_isp_uartd.sh: after this point, close the serial terminal and reopen COM3 from the browser UI"
+
+nohup /system/bin/t23_isp_uartd --port "${UART_DEV}" --baud "${UART_BAUD}" \
+	>/tmp/isp_uartd.log 2>&1 </dev/null &
+echo $! >/tmp/isp_uartd.pid
+
+sleep 1
+
+if kill -0 "$(cat /tmp/isp_uartd.pid 2>/dev/null)" 2>/dev/null; then
+	echo "start_isp_uartd.sh: daemon started successfully"
+else
+	echo "start_isp_uartd.sh: daemon failed to start"
+	exit 1
+fi

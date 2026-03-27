@@ -122,7 +122,10 @@ COM3 是当前更现实的选择，因为它已经是 UART log 口。
 /system/init/start_isp_uartd.sh /dev/ttyS1 921600
 ```
 
-5. 执行后关闭串口终端，再让浏览器 Web Serial 接管对应的 Windows `COM3`
+5. 这个脚本现在会把 `t23_isp_uartd` 以后台守护方式启动，并把日志写到：
+   - `/tmp/isp_uartd.log`
+   - `/tmp/isp_uartd.pid`
+6. 执行后关闭串口终端，再让浏览器 Web Serial 接管对应的 Windows `COM3`
 
 后面如果效果不错，再考虑：
 
@@ -240,3 +243,44 @@ python3 -m http.server 8080
    - 更复杂参数
    - 参数保存/加载
    - 最终网络版
+
+## 十、如果网页能发命令但没有任何返回
+
+这通常不是 JPEG 本身有问题，而是串口守护进程没有活着。
+
+典型现象：
+
+- 网页日志里只有：
+  - `> GET ALL`
+  - `> SET ...`
+  - `> SNAP`
+- 但没有任何：
+  - `< VAL ...`
+  - `< OK ...`
+  - `< JPEG ...`
+
+最常见原因：
+
+- 你是从同一条串口控制台启动 `t23_isp_uartd`
+- 然后为了让浏览器接管 COM 口，把终端软件关掉了
+- 结果前台进程跟着控制台一起退出
+
+现在推荐做法：
+
+1. 重新执行：
+
+```sh
+/system/init/start_isp_uartd.sh /dev/ttyS1 921600
+```
+
+2. 确认它提示 `daemon started successfully`
+3. 关闭串口终端
+4. 浏览器重新连接 `COM3`
+5. 先点 `Refresh Values`
+
+如果还是不通，重新用串口终端连回板子，查看：
+
+```sh
+cat /tmp/isp_uartd.log
+ps | grep isp_uartd
+```

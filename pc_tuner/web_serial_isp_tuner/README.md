@@ -58,3 +58,31 @@ Snapshot responses:
 4. Click `Connect Serial` and choose the matching Windows COM port, usually
    `COM3`.
 5. Click `Refresh Values`, then test one slider and finally `Capture Snapshot`.
+
+## If the page only shows outgoing commands
+
+If the log panel shows only lines like:
+
+- `> GET ALL`
+- `> SET BRIGHTNESS 120`
+- `> SNAP`
+
+but never shows any incoming lines like:
+
+- `< VAL ...`
+- `< OK ...`
+- `< JPEG ...`
+
+then the most likely cause is that `t23_isp_uartd` was started from the same
+serial login session and died when that terminal window closed.
+
+Use the updated startup helper:
+
+```sh
+/system/init/start_isp_uartd.sh /dev/ttyS1 921600
+```
+
+It now starts the daemon in the background and writes logs to:
+
+- `/tmp/isp_uartd.log`
+- `/tmp/isp_uartd.pid`
