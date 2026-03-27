@@ -45,15 +45,31 @@ echo "start_isp_uartd.sh: log file -> /tmp/isp_uartd.log"
 echo "start_isp_uartd.sh: pid file -> /tmp/isp_uartd.pid"
 echo "start_isp_uartd.sh: after this point, close the serial terminal and reopen COM3 from the browser UI"
 
-nohup /system/bin/t23_isp_uartd --port "${UART_DEV}" --baud "${UART_BAUD}" \
+rm -f /tmp/isp_uartd.log /tmp/isp_uartd.pid
+
+# 某些精简 rootfs 没有 nohup，所以这里直接用后台进程方式启动。
+# 当前脚本本身运行在系统启动链里，不依赖交互式 shell，因此这样足够稳定。
+/system/bin/t23_isp_uartd --port "${UART_DEV}" --baud "${UART_BAUD}" \
 	>/tmp/isp_uartd.log 2>&1 </dev/null &
-echo $! >/tmp/isp_uartd.pid
+echo $! > /tmp/isp_uartd.pid
 
-sleep 1
+retry=0
+while [ "$retry" -lt 5 ]; do
+	# 这里只检查进程是否还活着，而不强依赖串口是否已经收到首条命令。
+	# 这样做的原因是：
+	# 1. ISP pipeline 初始化本身可能就要几秒
+	# 2. 浏览器端连接还没发生时，守护进程本来就应该处于“空闲等待命令”状态
+	if kill -0 "$(cat /tmp/isp_uartd.pid 2>/dev/null)" 2>/dev/null; then
+		echo "start_isp_uartd.sh: daemon started successfully"
+		exit 0
+	fi
+	retry=$((retry + 1))
+	sleep 1
+done
 
-if kill -0 "$(cat /tmp/isp_uartd.pid 2>/dev/null)" 2>/dev/null; then
-	echo "start_isp_uartd.sh: daemon started successfully"
-else
-	echo "start_isp_uartd.sh: daemon failed to start"
-	exit 1
+echo "start_isp_uartd.sh: daemon failed to start"
+if [ -f /tmp/isp_uartd.log ]; then
+	echo "start_isp_uartd.sh: last log lines:"
+	tail -20 /tmp/isp_uartd.log || true
 fi
+exit 1

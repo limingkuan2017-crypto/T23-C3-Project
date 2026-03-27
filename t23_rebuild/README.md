@@ -51,6 +51,10 @@ Because of that change, vendor code is treated as reference only.
   beginner-oriented function guide
 - `docs/t23_learning_path_zh.md`
   step-by-step reading order for a first-time developer
+- `docs/isp_uartd_flow_zh.md`
+  detailed walkthrough of the serial ISP tuning daemon
+- `docs/boot_log_annotation_zh.md`
+  annotated explanation of the current successful boot log
 
 ## External dependencies
 
