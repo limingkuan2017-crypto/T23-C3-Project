@@ -43,7 +43,6 @@ TXT_NAME=T23N_gcc540_uclibc_16M_camera_diag.txt
 
 # 1. 先构建所有 T23 侧诊断程序。
 "$ROOT/scripts/build_camera.sh"
-(cd "$ROOT/app/spi_diag" && make clean all)
 
 # 2. 清理临时目录，并构造 /system 目录骨架。
 rm -rf "$TMP_DIR"
@@ -58,7 +57,8 @@ cp "$VENDOR_REF/build/images/root-uclibc-toolchain540.squashfs" "$TMP_DIR/root.i
 cp "$DRIVER_DIR"/*.ko "$SYSTEM_DIR/lib/modules/"
 cp "$SENSOR_DIR"/* "$SYSTEM_DIR/etc/sensor/"
 cp "$BIN_DIR/t23_camera_diag" "$SYSTEM_DIR/bin/"
-cp "$ROOT/output/t23_spi_diag" "$SYSTEM_DIR/bin/"
+cp "$BIN_DIR/t23_spi_diag" "$SYSTEM_DIR/bin/"
+cp "$BIN_DIR/t23_isp_uartd" "$SYSTEM_DIR/bin/"
 cp "$ROOT/init/"* "$SYSTEM_DIR/init/"
 chmod 755 "$SYSTEM_DIR/init/"*.sh
 

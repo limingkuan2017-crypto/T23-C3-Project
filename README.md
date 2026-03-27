@@ -8,6 +8,7 @@ Unified repository for the rebuilt T23N + ESP32-C3 system.
 T23-C3-Project/
 |-- t23_rebuild/
 |-- c3_rebuild/
+|-- pc_tuner/
 |-- t23_c3_shared/
 |-- third_party/
 |-- docs/
@@ -20,6 +21,8 @@ T23-C3-Project/
   T23-side Linux userspace bring-up, camera diagnostics, SPI master diagnostics
 - `c3_rebuild/`
   ESP32-C3 firmware used for SPI slave bring-up and later protocol work
+- `pc_tuner/`
+  PC-side tuning UI tools, currently focused on a browser Web Serial tuner
 - `t23_c3_shared/`
   shared protocol headers, pin map, handover docs and initialization flow docs
 - `third_party/`
@@ -78,6 +81,17 @@ cd <repo>
 ./scripts/bootstrap.sh --build-c3
 ```
 
+### PC Serial ISP Tuner
+
+```sh
+cd <repo>/pc_tuner/web_serial_isp_tuner
+python3 -m http.server 8080
+```
+
+Then open on Windows:
+
+- `http://localhost:8080`
+
 ### Build Everything
 
 ```sh
@@ -88,6 +102,7 @@ cd <repo>
 ## First Documents To Read
 
 - `docs/new_machine_setup_zh.md`
+- `docs/serial_isp_tuning_zh.md`
 - `t23_rebuild/docs/t23_runtime_flow.md`
 - `t23_rebuild/docs/t23_function_guide_zh.md`
 - `t23_rebuild/docs/t23_learning_path_zh.md`

@@ -11,7 +11,8 @@ It focuses on three layers:
 
 1. local camera/ISP/JPEG bring-up
 2. SPI master-side diagnostics
-3. later integration with ESP32-C3 and ImageTool
+3. serial ISP tuning bring-up for early tuning without WiFi
+4. later integration with ESP32-C3 and ImageTool
 
 ## Why it exists
 
@@ -34,8 +35,12 @@ Because of that change, vendor code is treated as reference only.
   vendor-derived media helper code used by the diagnostic app
 - `app/spi_diag/src/main.c`
   T23-side SPI master diagnostic tool
+- `app/isp_uartd/src/main.c`
+  T23-side serial ISP tuning daemon used by the browser tuner
 - `init/start.sh`
   minimal target startup chain
+- `init/start_isp_uartd.sh`
+  helper script that hands the UART console over to the ISP tuning daemon
 - `scripts/package_flash_image.sh`
   creates the final flashable T23 image
 - `docs/t23_runtime_flow.md`
@@ -65,3 +70,4 @@ and the dependency boundary stays obvious.
   - `t23_camera_diag framesource`
   - `t23_camera_diag jpeg`
   - `t23_spi_diag info`
+  - `start_isp_uartd.sh /dev/ttyS1 921600`

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>T23 ISP Serial Tuner</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="panel panel--hero">
+      <div>
+        <p class="eyebrow">T23 ISP Tuning</p>
+        <h1>Serial Web Tuner</h1>
+        <p class="subtitle">
+          Connect to the T23 debug UART, adjust ISP parameters, and pull JPEG
+          snapshots without depending on C3 networking first.
+        </p>
+      </div>
+      <div class="connection-card">
+        <div class="status-row">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
+        <div class="control-row">
+          <label for="baudSelect">Baud</label>
+          <select id="baudSelect">
+            <option value="115200">115200</option>
+            <option value="230400">230400</option>
+            <option value="460800">460800</option>
+            <option value="921600" selected>921600</option>
+          </select>
+        </div>
+        <div class="button-row">
+          <button id="connectBtn">Connect Serial</button>
+          <button id="disconnectBtn" disabled>Disconnect</button>
+          <button id="refreshBtn" disabled>Refresh Values</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-header">
+        <h2>ISP Controls</h2>
+        <div class="inline-tools">
+          <button id="autoPreviewBtn" disabled>Start Auto Preview</button>
+          <button id="snapBtn" disabled>Capture Snapshot</button>
+        </div>
+      </div>
+      <div class="grid" id="paramGrid"></div>
+    </section>
+
+    <section class="panel panel--preview">
+      <div class="section-header">
+        <h2>Preview</h2>
+        <p class="hint">
+          Snapshot preview over UART is lower frame rate than network preview,
+          but good enough for MVP tuning.
+        </p>
+      </div>
+      <div class="preview-wrap">
+        <img id="previewImage" alt="JPEG preview will appear here">
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-header">
+        <h2>Log</h2>
+        <button id="clearLogBtn">Clear</button>
+      </div>
+      <pre id="logBox" class="log-box"></pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
