@@ -550,16 +550,32 @@ static int set_awb_ct_value(int value)
  *   1. 在 g_params 中找到 name == "BRIGHTNESS" 的项
  *   2. 调用对应的 set_value()
  *   3. 再调用 get_value() 回读一次，确认实际生效值
+ *
+ * 这里列出来的并不是“君正公开 SDK 的全部 ISP 参数”，而只是
+ * 当前网页 MVP 先接入的 8 个常用参数。选择它们的原则是：
+ * - SDK 里已经有稳定的 get/set 接口
+ * - 调整效果比较直观，适合用滑块快速验证
+ * - 对当前“电视画面采集/氛围灯”场景有第一批调参价值
+ *
+ * 每一项的大致视觉意义：
+ * - BRIGHTNESS: 整体明暗偏移
+ * - CONTRAST: 明暗分离度
+ * - SHARPNESS: 边缘增强强度
+ * - SATURATION: 颜色浓度
+ * - AE_COMP: 自动曝光目标亮度
+ * - DPC: 坏点校正强度
+ * - DRC: 动态范围压缩强度
+ * - AWB_CT: 自动白平衡色温目标
  */
 static isp_param_desc_t g_params[] = {
-    { "BRIGHTNESS", get_brightness_value, set_brightness_value, 0, 255 },
-    { "CONTRAST", get_contrast_value, set_contrast_value, 0, 255 },
-    { "SHARPNESS", get_sharpness_value, set_sharpness_value, 0, 255 },
-    { "SATURATION", get_saturation_value, set_saturation_value, 0, 255 },
-    { "AE_COMP", get_ae_comp_value, set_ae_comp_value, 90, 250 },
-    { "DPC", get_dpc_value, set_dpc_value, 0, 255 },
-    { "DRC", get_drc_value, set_drc_value, 0, 255 },
-    { "AWB_CT", get_awb_ct_value, set_awb_ct_value, 1500, 12000 },
+    { "BRIGHTNESS", get_brightness_value, set_brightness_value, 0, 255 },   /* 默认 128 */
+    { "CONTRAST", get_contrast_value, set_contrast_value, 0, 255 },         /* 默认 128 */
+    { "SHARPNESS", get_sharpness_value, set_sharpness_value, 0, 255 },      /* 默认 128 */
+    { "SATURATION", get_saturation_value, set_saturation_value, 0, 255 },   /* 默认 128 */
+    { "AE_COMP", get_ae_comp_value, set_ae_comp_value, 90, 250 },           /* 自动曝光补偿 */
+    { "DPC", get_dpc_value, set_dpc_value, 0, 255 },                        /* 坏点校正强度 */
+    { "DRC", get_drc_value, set_drc_value, 0, 255 },                        /* 动态范围压缩 */
+    { "AWB_CT", get_awb_ct_value, set_awb_ct_value, 1500, 12000 },          /* 色温，单位 K */
 };
 
 /**

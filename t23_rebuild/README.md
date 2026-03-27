@@ -53,6 +53,8 @@ Because of that change, vendor code is treated as reference only.
   step-by-step reading order for a first-time developer
 - `docs/isp_uartd_flow_zh.md`
   detailed walkthrough of the serial ISP tuning daemon
+- `docs/isp_parameter_guide_zh.md`
+  detailed explanation of each exposed ISP parameter and useful next-stage APIs
 - `docs/boot_log_annotation_zh.md`
   annotated explanation of the current successful boot log
 
