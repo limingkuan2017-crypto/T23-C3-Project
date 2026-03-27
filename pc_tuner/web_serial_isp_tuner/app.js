@@ -19,9 +19,14 @@ const ui = {
   baudSelect: document.getElementById("baudSelect"),
   statusText: document.getElementById("statusText"),
   statusDot: document.getElementById("statusDot"),
+  autoRefreshOnConnect: document.getElementById("autoRefreshOnConnect"),
+  autoSnapOnConnect: document.getElementById("autoSnapOnConnect"),
+  autoSnapAfterSet: document.getElementById("autoSnapAfterSet"),
+  liveApplyOnRelease: document.getElementById("liveApplyOnRelease"),
   logBox: document.getElementById("logBox"),
   paramGrid: document.getElementById("paramGrid"),
   previewImage: document.getElementById("previewImage"),
+  previewStatus: document.getElementById("previewStatus"),
 };
 
 const state = {
@@ -37,6 +42,7 @@ const state = {
   autoPreviewTimer: null,
   previewBusy: false,
   previewUrl: null,
+  autoSnapTimer: null,
 };
 
 function concatUint8(a, b) {
@@ -59,6 +65,18 @@ function log(message) {
   const ts = new Date().toLocaleTimeString();
   ui.logBox.textContent += `[${ts}] ${message}\n`;
   ui.logBox.scrollTop = ui.logBox.scrollHeight;
+}
+
+function setPreviewStatus(text, kind = "idle") {
+  ui.previewStatus.textContent = text;
+  ui.previewStatus.classList.remove("is-busy", "is-good", "is-bad");
+  if (kind === "busy") {
+    ui.previewStatus.classList.add("is-busy");
+  } else if (kind === "good") {
+    ui.previewStatus.classList.add("is-good");
+  } else if (kind === "bad") {
+    ui.previewStatus.classList.add("is-bad");
+  }
 }
 
 function updateConnectionUi() {
@@ -98,8 +116,15 @@ function renderParams() {
       value.textContent = slider.value;
     });
 
+    slider.addEventListener("change", async () => {
+      if (!state.connected || !ui.liveApplyOnRelease.checked) {
+        return;
+      }
+      await sendSetCommand(param.key, slider.value);
+    });
+
     applyBtn.addEventListener("click", async () => {
-      await sendCommand(`SET ${param.key} ${slider.value}`);
+      await sendSetCommand(param.key, slider.value);
     });
 
     readBtn.addEventListener("click", async () => {
@@ -134,10 +159,13 @@ async function connectSerial() {
   state.connected = true;
   updateConnectionUi();
   updateParamUiEnabled();
+  setPreviewStatus("Connected, waiting for first frame");
   log("serial connected");
   readLoop().catch((err) => {
     log(`read loop ended: ${err.message}`);
+    setPreviewStatus("Serial read loop ended", "bad");
   });
+  await runConnectBootstrap();
 }
 
 async function disconnectSerial() {
@@ -174,6 +202,14 @@ async function disconnectSerial() {
     log(`port close warning: ${err.message}`);
   }
 
+  state.rxBuffer = new Uint8Array(0);
+  state.binaryRemaining = 0;
+  state.binaryChunks = [];
+  if (state.autoSnapTimer) {
+    clearTimeout(state.autoSnapTimer);
+    state.autoSnapTimer = null;
+  }
+  setPreviewStatus("Disconnected");
   log("serial disconnected");
 }
 
@@ -183,6 +219,40 @@ async function sendCommand(command) {
   }
   log(`> ${command}`);
   await state.writer.write(state.textEncoder.encode(`${command}\n`));
+}
+
+async function sendSetCommand(key, value) {
+  await sendCommand(`SET ${key} ${value}`);
+}
+
+function scheduleAutoSnapshot(delayMs = 220) {
+  if (!state.connected || !ui.autoSnapAfterSet.checked) {
+    return;
+  }
+  if (state.autoSnapTimer) {
+    clearTimeout(state.autoSnapTimer);
+  }
+  state.autoSnapTimer = window.setTimeout(async () => {
+    state.autoSnapTimer = null;
+    if (!state.connected || state.previewBusy) {
+      return;
+    }
+    setPreviewStatus("Capturing updated frame...", "busy");
+    state.previewBusy = true;
+    await sendCommand("SNAP");
+  }, delayMs);
+}
+
+async function runConnectBootstrap() {
+  await sendCommand("PING");
+  if (ui.autoRefreshOnConnect.checked) {
+    await sendCommand("GET ALL");
+  }
+  if (ui.autoSnapOnConnect.checked) {
+    setPreviewStatus("Capturing first frame...", "busy");
+    state.previewBusy = true;
+    await sendCommand("SNAP");
+  }
 }
 
 function handleTextLine(line) {
@@ -202,11 +272,35 @@ function handleTextLine(line) {
     return;
   }
 
+  if (line === "PONG") {
+    setPreviewStatus("Device online", "good");
+    return;
+  }
+
+  if (line === "OK GET ALL") {
+    setPreviewStatus("Parameters refreshed", "good");
+    return;
+  }
+
+  if (line.startsWith("OK SET ")) {
+    const key = line.slice("OK SET ".length);
+    setPreviewStatus(`Applied ${key}`, "good");
+    scheduleAutoSnapshot();
+    return;
+  }
+
+  if (line.startsWith("ERR ")) {
+    state.previewBusy = false;
+    setPreviewStatus(line, "bad");
+    return;
+  }
+
   if (line.startsWith("JPEG ")) {
     const [, lengthText] = line.split(/\s+/);
     state.binaryRemaining = Number(lengthText);
     state.binaryChunks = [];
     state.previewBusy = true;
+    setPreviewStatus(`Receiving JPEG (${lengthText} bytes)...`, "busy");
     return;
   }
 }
@@ -234,6 +328,7 @@ function appendBinaryChunk(chunk) {
     ui.previewImage.src = state.previewUrl;
     state.binaryChunks = [];
     state.previewBusy = false;
+    setPreviewStatus("Preview updated", "good");
     log("< JPEG frame complete");
   }
 
@@ -323,10 +418,15 @@ ui.disconnectBtn.addEventListener("click", async () => {
 });
 
 ui.refreshBtn.addEventListener("click", async () => {
+  setPreviewStatus("Refreshing parameters...", "busy");
   await sendCommand("GET ALL");
 });
 
 ui.snapBtn.addEventListener("click", async () => {
+  if (state.previewBusy) {
+    return;
+  }
+  setPreviewStatus("Capturing snapshot...", "busy");
   state.previewBusy = true;
   await sendCommand("SNAP");
 });
@@ -346,4 +446,5 @@ ui.clearLogBtn.addEventListener("click", () => {
 renderParams();
 updateConnectionUi();
 updateParamUiEnabled();
+setPreviewStatus("Idle");
 log("open this page in Edge or Chrome, then connect to the T23 UART");

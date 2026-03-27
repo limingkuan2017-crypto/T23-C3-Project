@@ -36,6 +36,24 @@
           <button id="disconnectBtn" disabled>Disconnect</button>
           <button id="refreshBtn" disabled>Refresh Values</button>
         </div>
+        <div class="options-grid">
+          <label class="option-chip">
+            <input id="autoRefreshOnConnect" type="checkbox" checked>
+            <span>Auto refresh on connect</span>
+          </label>
+          <label class="option-chip">
+            <input id="autoSnapOnConnect" type="checkbox" checked>
+            <span>Grab first preview on connect</span>
+          </label>
+          <label class="option-chip">
+            <input id="autoSnapAfterSet" type="checkbox" checked>
+            <span>Auto snapshot after set</span>
+          </label>
+          <label class="option-chip">
+            <input id="liveApplyOnRelease" type="checkbox" checked>
+            <span>Live apply on slider release</span>
+          </label>
+        </div>
       </div>
     </section>
 
@@ -53,10 +71,13 @@
     <section class="panel panel--preview">
       <div class="section-header">
         <h2>Preview</h2>
-        <p class="hint">
-          Snapshot preview over UART is lower frame rate than network preview,
-          but good enough for MVP tuning.
-        </p>
+        <div class="preview-meta">
+          <p class="hint">
+            Snapshot preview over UART is lower frame rate than network preview,
+            but good enough for MVP tuning.
+          </p>
+          <span id="previewStatus" class="preview-status">Idle</span>
+        </div>
       </div>
       <div class="preview-wrap">
         <img id="previewImage" alt="JPEG preview will appear here">
