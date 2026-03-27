@@ -1,0 +1,26 @@
+# Common generated output
+**/build/
+**/output/
+**/_release/
+*.o
+*.d
+*.ko
+*.img
+*.bin
+*.map
+*.elf
+*.log
+
+# ESP-IDF local outputs
+c3_rebuild/sdkconfig.old
+c3_rebuild/build/
+
+# T23 generated outputs
+t23_rebuild/output/
+t23_rebuild/_release/
+t23_rebuild/app/camera/build/
+t23_rebuild/app/spi_diag/build/
+
+# Local dependency area (keep docs, ignore actual payloads)
+third_party/ingenic_t23_sdk
+third_party/vendor_reference
