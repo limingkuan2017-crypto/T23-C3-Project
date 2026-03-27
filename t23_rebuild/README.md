@@ -39,6 +39,8 @@ Because of that change, vendor code is treated as reference only.
   T23-side serial ISP tuning daemon used by the browser tuner
 - `init/start.sh`
   minimal target startup chain
+- `init/app_mode.conf`
+  controls whether boot enters `camera_diag` or `isp_uartd`
 - `init/start_isp_uartd.sh`
   helper script that hands the UART console over to the ISP tuning daemon
 - `scripts/package_flash_image.sh`
@@ -71,3 +73,16 @@ and the dependency boundary stays obvious.
   - `t23_camera_diag jpeg`
   - `t23_spi_diag info`
   - `start_isp_uartd.sh /dev/ttyS1 921600`
+
+## Recommended daily tuning flow
+
+For routine ISP tuning, you usually do not need to open a serial terminal
+first. Instead, set:
+
+- `APP_MODE=isp_uartd`
+
+in:
+
+- `init/app_mode.conf`
+
+Then boot the board and connect the browser directly to the Windows UART port.

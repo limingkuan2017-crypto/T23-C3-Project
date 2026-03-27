@@ -50,6 +50,26 @@ PC 浏览器界面
 - 页面调试方便
 - 后面如果要升级成更复杂工具，前端可以继续复用
 
+网页里适合显示的是“调参协议日志”，例如：
+
+- `> GET ALL`
+- `< VAL BRIGHTNESS 101`
+- `< OK GET ALL`
+- `< JPEG 25466`
+
+但不建议把 kernel log、login 提示、普通 shell 输出也混进同一条串口协议里。
+
+原因是：
+
+- 这些日志会破坏协议边界
+- 浏览器端很难同时把“普通文本日志”和“JPEG 二进制帧”稳定区分开
+- 一旦混传，最容易先坏掉的就是 `SNAP` 预览
+
+所以更合理的分工是：
+
+- 网页显示调参协议日志
+- 系统启动日志只在需要排障时，用串口工具单独查看
+
 ## 三、实时预览难不难
 
 ### 1. 网络式实时预览
@@ -132,7 +152,50 @@ COM3 是当前更现实的选择，因为它已经是 UART log 口。
 - 给调参单独腾一条 UART
 - 或者等 C3 网络通了，再升级成网络版
 
-## 五、当前已经搭好的组成部分
+## 五、流程能不能再简化
+
+可以，而且推荐简化成“上电后直接开网页”的方式。
+
+### 旧流程
+
+```text
+SecureCRT 打开 COM3
+  -> 登录 Linux
+  -> 手动执行 start_isp_uartd.sh
+  -> 关闭 SecureCRT
+  -> 浏览器打开 COM3
+  -> 调参
+```
+
+这个流程适合最初 bring-up，但日常调参确实麻烦。
+
+### 新推荐流程
+
+```text
+T23 上电
+  -> Linux 自动启动 isp_uartd
+  -> 浏览器直接打开 COM3
+  -> 刷当前参数
+  -> 调参 + 抓拍预览
+```
+
+现在启动链已经支持这个模式：
+
+- `app_main.sh` 支持 `APP_MODE=isp_uartd`
+- 默认配置文件在：
+  - `/system/init/app_mode.conf`
+
+如果你想让镜像开机后直接进入网页调参模式，把这个文件改成：
+
+```sh
+APP_MODE=isp_uartd
+UART_DEV=/dev/ttyS1
+UART_BAUD=921600
+```
+
+这样大多数情况下就不需要先开 SecureCRT 了。
+
+## 六、当前已经搭好的组成部分
 
 ### 1. T23 串口调参守护进程
 
@@ -163,7 +226,7 @@ COM3 是当前更现实的选择，因为它已经是 UART log 口。
 - 调整滑块
 - 显示 JPEG 快照
 
-## 六、第一版支持哪些参数
+## 七、第一版支持哪些参数
 
 优先选择了“官方 SDK 已经提供直接 get/set 接口”的参数：
 
@@ -178,7 +241,7 @@ COM3 是当前更现实的选择，因为它已经是 UART log 口。
 
 这样第一版最容易稳定。
 
-## 七、当前协议是什么样
+## 八、当前协议是什么样
 
 PC -> T23：
 
@@ -202,7 +265,7 @@ JPEG 25466
 <raw jpeg bytes>
 ```
 
-## 八、当前路线的现实判断
+## 九、当前路线的现实判断
 
 ### 可做
 
@@ -216,35 +279,36 @@ JPEG 25466
 - 先走 COM8 USB 交互
 - 先做高帧率实时视频预览
 
-## 九、下一阶段建议
+## 十、下一阶段建议
 
 当前建议按这个顺序推进：
 
-1. 把 `t23_isp_uartd` 和 `start_isp_uartd.sh` 放到镜像里
-2. 上板后先执行：
+1. 把 `t23_isp_uartd`、`start_isp_uartd.sh` 和 `app_mode.conf` 放到镜像里
+2. 如果还处于手动模式，上板后先执行：
 
 ```sh
 /system/init/start_isp_uartd.sh /dev/ttyS1 921600
 ```
 
-3. 在 PC 上启动网页：
+3. 如果已经把 `APP_MODE=isp_uartd` 写进 `/system/init/app_mode.conf`，则上电后可直接跳过上一步
+4. 在 PC 上启动网页：
 
 ```sh
 cd ~/T23-C3-Project/pc_tuner/web_serial_isp_tuner
 python3 -m http.server 8080
 ```
 
-4. 在 Windows 浏览器里打开 `http://localhost:8080`
-5. 先验证 `Refresh Values`
-6. 再验证单个 `SET`
-7. 再验证 `Capture Snapshot`
-8. 最后再开 `Auto Preview`
-9. 稳定后再决定是否继续做：
+5. 在 Windows 浏览器里打开 `http://localhost:8080`
+6. 先验证 `Refresh Values`
+7. 再验证单个 `SET`
+8. 再验证 `Capture Snapshot`
+9. 最后再开 `Auto Preview`
+10. 稳定后再决定是否继续做：
    - 更复杂参数
    - 参数保存/加载
    - 最终网络版
 
-## 十、如果网页能发命令但没有任何返回
+## 十一、如果网页能发命令但没有任何返回
 
 这通常不是 JPEG 本身有问题，而是串口守护进程没有活着。
 
