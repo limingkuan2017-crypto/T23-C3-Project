@@ -31,7 +31,13 @@ cd "$ROOT/app/isp_uartd"
 make clean
 make
 
+# 4. 构建 WiFi/UART/SPI 桥接守护进程。
+cd "$ROOT/app/isp_bridge"
+make clean
+make
+
 echo
 echo "Built: $ROOT/output/t23_camera_diag"
 echo "Built: $ROOT/output/t23_spi_diag"
 echo "Built: $ROOT/output/t23_isp_uartd"
+echo "Built: $ROOT/output/t23_isp_bridge"

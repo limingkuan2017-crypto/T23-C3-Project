@@ -1,61 +1,24 @@
 # c3_rebuild
 
-ESP32-C3 rebuild project for the new T23N + C3 architecture.
+这里是 ESP32-C3 侧工程。
 
-## Current role
+当前它负责：
 
-At the current stage, this project is intentionally small and deterministic.
-It exists only to prove that the new T23<->C3 SPI wiring works.
+- 连接 WiFi 路由器
+- 提供网页端
+- 通过 UART 控制 T23
+- 通过 SPI 从 T23 接收 JPEG
 
-The firmware currently:
+如果要看代码，不建议单独找旧说明，直接读：
 
-- runs as an SPI slave
-- drives `Data Ready` on IO3
-- returns a fixed 4-byte pattern to T23
+1. [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)
+2. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
+3. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
 
-## Why it is separate
-
-This project uses a different toolchain and different runtime model from T23.
-Keeping it separate avoids mixing Linux userspace code with ESP-IDF firmware.
-
-Shared definitions live in:
-
-- `../t23_c3_shared`
-- ESP-IDF is expected through `IDF_PATH` or the local default
-  `~/.espressif/v5.4.3/esp-idf`
-
-## Important files
-
-- `main/main.c`
-  SPI slave test firmware entry point
-- `scripts/idf_build.sh`
-  build helper
-- `scripts/idf_flash.sh`
-  automatic flash helper
-- `scripts/manual_flash.sh`
-  manual download-mode helper
-- `docs/c3_runtime_flow.md`
-  first document a new developer should read
-
-## Build
+## 最常用命令
 
 ```sh
-cd <repo>/c3_rebuild
-./scripts/idf_build.sh
-```
-
-## Flash
-
-Automatic reset path:
-
-```sh
-cd <repo>/c3_rebuild
-./scripts/idf_flash.sh /dev/ttyACM0
-```
-
-Manual boot/download path:
-
-```sh
-cd <repo>/c3_rebuild
-./scripts/manual_flash.sh /dev/ttyACM0
+cd /home/kuan/T23-C3-Project/c3_rebuild
+source ./scripts/idf_env.sh
+idf.py -p /dev/ttyUSB0 flash monitor
 ```

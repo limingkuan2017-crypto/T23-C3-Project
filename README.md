@@ -1,110 +1,54 @@
 # T23-C3-Project
 
-Unified repository for the rebuilt T23N + ESP32-C3 system.
+这个仓库是当前 `T23N + ESP32-C3` 方案的统一工程入口。
 
-## Repository Layout
+如果你现在只想快速理解项目，不要再分散读很多文档，直接按下面顺序看：
 
-```text
-T23-C3-Project/
-|-- t23_rebuild/
-|-- c3_rebuild/
-|-- pc_tuner/
-|-- t23_c3_shared/
-|-- third_party/
-|-- docs/
-\-- scripts/
-```
+1. [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)
+2. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
+3. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
+4. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
+5. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
 
-## What Each Folder Does
+## 目录说明
 
-- `t23_rebuild/`
-  T23-side Linux userspace bring-up, camera diagnostics, SPI master diagnostics
-- `c3_rebuild/`
-  ESP32-C3 firmware used for SPI slave bring-up and later protocol work
-- `pc_tuner/`
-  PC-side tuning UI tools, currently focused on a browser Web Serial tuner
-- `t23_c3_shared/`
-  shared protocol headers, pin map, handover docs and initialization flow docs
-- `third_party/`
-  local-only location for external dependencies not stored in Git
-- `docs/`
-  repository-level notes and onboarding documents
-- `scripts/`
-  repository-level helper scripts
+- [t23_rebuild](/home/kuan/T23-C3-Project/t23_rebuild)
+  T23 侧应用、启动脚本、打包镜像
+- [c3_rebuild](/home/kuan/T23-C3-Project/c3_rebuild)
+  ESP32-C3 固件、网页服务、WiFi bridge
+- [t23_c3_shared](/home/kuan/T23-C3-Project/t23_c3_shared)
+  T23 与 C3 共用协议和边框提取数据结构
+- [configs](/home/kuan/T23-C3-Project/configs)
+  新旧硬件串口内核配置快照
+- [third_party](/home/kuan/T23-C3-Project/third_party)
+  官方 SDK 与供应商参考工程入口
 
-## External Dependencies
+## 最常用命令
 
-To keep the repository portable and safe to share, external dependencies are
-not committed here. Place them under `third_party/`:
-
-- `third_party/ingenic_t23_sdk`
-  extracted Ingenic T23 SDK root
-- `third_party/vendor_reference`
-  vendor reference project root
-
-The T23 build scripts already look for dependencies in those locations.
-
-## First-Time Setup
-
-For a fresh machine, read:
-
-- `docs/new_machine_setup_zh.md`
-
-Quick check:
+### T23 打包
 
 ```sh
-cd <repo>
-./scripts/bootstrap.sh --check
+cd /home/kuan/T23-C3-Project/t23_rebuild
+./scripts/package_flash_image.sh
 ```
 
-## Quick Start
-
-### Check Everything First
+### C3 刷机
 
 ```sh
-cd <repo>
-./scripts/bootstrap.sh --check
+cd /home/kuan/T23-C3-Project/c3_rebuild
+source ./scripts/idf_env.sh
+idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-### T23 Build
+### 切换 T23 串口内核配置
 
 ```sh
-cd <repo>
-./scripts/bootstrap.sh --build-t23
-./scripts/bootstrap.sh --package-t23
+cd /home/kuan/T23-C3-Project
+./scripts/apply_t23_kernel_serial_profile.sh t23_new_hw
 ```
 
-### ESP32-C3 Build
+或：
 
 ```sh
-cd <repo>
-./scripts/bootstrap.sh --build-c3
+./scripts/apply_t23_kernel_serial_profile.sh t23_vendor_hw
 ```
-
-### PC Serial ISP Tuner
-
-```sh
-cd <repo>/pc_tuner/web_serial_isp_tuner
-python3 -m http.server 8080
-```
-
-Then open on Windows:
-
-- `http://localhost:8080`
-
-### Build Everything
-
-```sh
-cd <repo>
-./scripts/bootstrap.sh --all
-```
-
-## First Documents To Read
-
-- `docs/new_machine_setup_zh.md`
-- `docs/serial_isp_tuning_zh.md`
-- `t23_rebuild/docs/t23_runtime_flow.md`
-- `t23_rebuild/docs/t23_function_guide_zh.md`
-- `t23_rebuild/docs/t23_learning_path_zh.md`
-- `t23_c3_shared/docs/system_initialization_flow_zh.md`
-- `t23_c3_shared/docs/project_handover.md`

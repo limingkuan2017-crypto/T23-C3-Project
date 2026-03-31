@@ -1,31 +1,14 @@
 # t23_c3_shared
 
-Shared interface layer for the T23N and ESP32-C3 rebuild projects.
+这里放 T23 和 C3 共用的协议与数据结构。
 
-## Why this folder matters
+当前最重要的两个头文件：
 
-T23 and C3 must be built independently, but they still need one common source of
-truth for:
+- [t23_c3_protocol.h](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
+  当前 UART/SPI bridge 协议
+- [t23_border_pipeline.h](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_border_pipeline.h)
+  下一阶段边框提取和 50 色块的数据结构
 
-- pin definitions
-- SPI test expectations
-- future packet definitions
+项目说明统一看：
 
-That source of truth lives here.
-
-## Contents
-
-- `include/t23_c3_protocol.h`
-  constants and reserved packet definitions
-- `docs/pinmap.md`
-  hardware mapping for the new architecture
-- `docs/protocol.md`
-  staged protocol evolution plan
-- `docs/test_vectors.md`
-  bring-up commands and expected outputs
-- `docs/system_initialization_flow.md`
-  full initialization sequence from power-on to SPI bring-up
-- `docs/system_initialization_flow_zh.md`
-  中文版初始化流程说明
-- `docs/project_handover.md`
-  newcomer-facing overview of the whole rebuild effort
+- [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)

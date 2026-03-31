@@ -22,6 +22,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 . "$ROOT/scripts/env.sh" >/dev/null
+ . "$ROOT/init/app_mode.conf"
 VENDOR_REF="$T23_VENDOR_REF"
 OUT_DIR="$ROOT/_release/image_t23"
 TMP_DIR="$OUT_DIR/.tmp"
@@ -55,14 +56,22 @@ cp "$VENDOR_REF/build/images/uImage" "$TMP_DIR/"
 cp "$VENDOR_REF/build/images/uImage" "$TMP_DIR/kernel.img"
 
 # vendor rootfs 默认会通过 busybox init 的 inittab 在 console 上 respawn getty。
-# 这会不断抢占 ttyS1，导致我们的 Web Serial 调参协议收到 "Password:"。
-# 所以这里在打包时把 getty 行注释掉，让 UART 在启动后真正空出来给 isp_uartd。
+# 对 camera_diag 模式来说，我们希望保留 shell，方便手工执行 t23_spi_diag。
+# 对 isp_uartd 模式来说，则必须禁用 getty，否则 ttyS1 会被 login 抢占，
+# 浏览器端就会收到 "Password:" 这类无关文本。
 unsquashfs -d "$ROOTFS_DIR" "$VENDOR_REF/build/images/root-uclibc-toolchain540.squashfs" >/dev/null
-sed -i 's@^console::respawn:/sbin/getty -L console 115200 vt100 # GENERIC_SERIAL@# console getty disabled by t23_rebuild package for ISP UART tuning@' \
-	"$ROOTFS_DIR/etc/inittab"
+
+ROOTFS_NOTE="repacked root-uclibc-toolchain540.squashfs (console getty enabled)"
+
+if [ "${APP_MODE:-camera_diag}" = "isp_uartd" ] || [ "${APP_MODE:-camera_diag}" = "isp_bridge" ]; then
+	sed -i 's@^console::respawn:/sbin/getty -L console 115200 vt100 # GENERIC_SERIAL@# console getty disabled by t23_rebuild package for ISP UART tuning@' \
+		"$ROOTFS_DIR/etc/inittab"
+	ROOTFS_NOTE="repacked root-uclibc-toolchain540.squashfs (console getty disabled for ${APP_MODE})"
+fi
 
 # 这里仍然保留 vendor 的 rcS、基础工具链和系统目录结构，只做最小必要修改。
-# 这样可以最大限度复用“已知可启动”的底座，同时把串口口子从 login 手里让出来。
+# 这样可以最大限度复用“已知可启动”的底座。
+# 如果当前打包模式是 isp_uartd，还会顺带把串口口子从 login 手里让出来。
 mksquashfs "$ROOTFS_DIR" "$TMP_DIR/root-uclibc-toolchain540.squashfs" -noappend -comp xz >/dev/null
 cp "$TMP_DIR/root-uclibc-toolchain540.squashfs" "$TMP_DIR/root.img"
 
@@ -72,6 +81,7 @@ cp "$SENSOR_DIR"/* "$SYSTEM_DIR/etc/sensor/"
 cp "$BIN_DIR/t23_camera_diag" "$SYSTEM_DIR/bin/"
 cp "$BIN_DIR/t23_spi_diag" "$SYSTEM_DIR/bin/"
 cp "$BIN_DIR/t23_isp_uartd" "$SYSTEM_DIR/bin/"
+cp "$BIN_DIR/t23_isp_bridge" "$SYSTEM_DIR/bin/"
 
 # /system/init 下面既包含 app_init.sh / app_main.sh 这样的启动脚本，
 # 也包含 start_isp_uartd.sh / app_mode.conf 这样的调参模式配置。
@@ -107,12 +117,12 @@ cp "$TMP_DIR/$IMAGE_NAME" "$OUT_DIR/"
 # 10. 生成一份简单文本清单，方便后续追踪产物信息。
 cat > "$OUT_DIR/$TXT_NAME" <<EOF
 project    : t23_rebuild
-mode       : camera_diag
+mode       : ${APP_MODE:-camera_diag}
 binary     : t23_camera_diag
 sensor     : sc2337p
 vendor_ref : $VENDOR_REF
 drivers    : $(cd "$DRIVER_DIR" && ls *.ko | sed 's/.ko//g' | tr '\n' ' ')
-rootfs     : repacked root-uclibc-toolchain540.squashfs (console getty disabled)
+rootfs     : $ROOTFS_NOTE
 EOF
 
 # 11. 打印输出结果。

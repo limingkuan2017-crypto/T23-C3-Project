@@ -1,94 +1,29 @@
 # t23_rebuild
 
-T23-side rebuild workspace for the new T23N + ESP32-C3 architecture.
+这里是 T23 侧工程。
 
-## What this project is for
+如果要理解当前程序，不建议再翻很多旧文档，直接看：
 
-This project exists to make the T23 side understandable and testable without
-depending on the old vendor application model.
+1. [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)
+2. [app_main.sh](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
+3. [isp_bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
+4. [camera_common.h](/home/kuan/T23-C3-Project/t23_rebuild/app/camera/include/camera_common.h)
 
-It focuses on three layers:
+## 当前职责
 
-1. local camera/ISP/JPEG bring-up
-2. SPI master-side diagnostics
-3. serial ISP tuning bring-up for early tuning without WiFi
-4. later integration with ESP32-C3 and ImageTool
+- 相机采集
+- ISP 调参
+- JPEG 生成
+- 通过 UART 接收 C3 控制命令
+- 通过 SPI 向 C3 发送图像数据
 
-## Why it exists
+## 当前最常用命令
 
-The vendor project was built for a different hardware architecture:
+```sh
+cd /home/kuan/T23-C3-Project/t23_rebuild
+./scripts/package_flash_image.sh
+```
 
-- old model: T23 acted as the overall controller and C3 behaved more like a
-  network sidecar
-- new model: T23 handles image capture, C3 handles communication, and SPI is
-  only a transport path
+生成镜像：
 
-Because of that change, vendor code is treated as reference only.
-
-## Important files
-
-- `app/camera/src/main.c`
-  staged camera diagnostic entry point
-- `app/camera/include/camera_common.h`
-  high-level camera constants, structures and helper declarations
-- `app/camera/src/camera_common.c`
-  vendor-derived media helper code used by the diagnostic app
-- `app/spi_diag/src/main.c`
-  T23-side SPI master diagnostic tool
-- `app/isp_uartd/src/main.c`
-  T23-side serial ISP tuning daemon used by the browser tuner
-- `init/start.sh`
-  minimal target startup chain
-- `init/app_mode.conf`
-  controls whether boot enters `camera_diag` or `isp_uartd`
-- `init/start_isp_uartd.sh`
-  helper script that hands the UART console over to the ISP tuning daemon
-- `scripts/package_flash_image.sh`
-  creates the final flashable T23 image
-- `docs/t23_runtime_flow.md`
-  first document a new developer should read
-- `docs/t23_function_guide_zh.md`
-  beginner-oriented function guide
-- `docs/t23_learning_path_zh.md`
-  step-by-step reading order for a first-time developer
-- `docs/isp_uartd_flow_zh.md`
-  detailed walkthrough of the serial ISP tuning daemon
-- `docs/isp_parameter_guide_zh.md`
-  detailed explanation of each exposed ISP parameter and useful next-stage APIs
-- `docs/boot_log_annotation_zh.md`
-  annotated explanation of the current successful boot log
-
-## External dependencies
-
-This project expects external, non-repository dependencies to live under the
-repository root:
-
-- `../third_party/ingenic_t23_sdk`
-- `../third_party/vendor_reference`
-
-They are kept outside `t23_rebuild` so the repository structure stays portable
-and the dependency boundary stays obvious.
-
-## First useful commands
-
-- Build diagnostics: `./scripts/build_camera.sh`
-- Package flash image: `./scripts/package_flash_image.sh`
-- On target:
-  - `t23_camera_diag isp-only`
-  - `t23_camera_diag framesource`
-  - `t23_camera_diag jpeg`
-  - `t23_spi_diag info`
-  - `start_isp_uartd.sh /dev/ttyS1 921600`
-
-## Recommended daily tuning flow
-
-For routine ISP tuning, you usually do not need to open a serial terminal
-first. Instead, set:
-
-- `APP_MODE=isp_uartd`
-
-in:
-
-- `init/app_mode.conf`
-
-Then boot the board and connect the browser directly to the Windows UART port.
+- [T23N_gcc540_uclibc_16M_camera_diag.img](/home/kuan/T23-C3-Project/t23_rebuild/_release/image_t23/T23N_gcc540_uclibc_16M_camera_diag.img)

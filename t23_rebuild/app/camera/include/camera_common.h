@@ -47,7 +47,18 @@ extern "C"
  * Current board selection:
  * - sensor driver: sc2337p
  * - bus: i2c0
- * - bring-up size: 640x320
+ * - realtime preview size: 640x320
+ *
+ * Why this is intentionally small:
+ * - the product goal is not full-frame recording
+ * - we only need stable, low-latency color sampling around the TV border
+ * - smaller preview frames reduce JPEG encode time, SPI transfer time and C3
+ *   buffering pressure
+ *
+ * A larger one-shot calibration/snapshot path can still be added later for:
+ * - manual border picking
+ * - lens/distortion calibration
+ * - debugging image quality in more detail
  */
 #define SENSOR_SC2337P
 /* #define SENSOR_SC1346 */
@@ -251,8 +262,8 @@ extern "C"
 #define SENSOR_CUBS_TYPE            TX_SENSOR_CONTROL_INTERFACE_I2C
 #define SENSOR_I2C_ADDR             0x30
 #define SENSOR_I2C_ADAPTER_ID       0
-#define SENSOR_WIDTH                640 /* Original full width was 1920. */
-#define SENSOR_HEIGHT               320 /* Original full height was 1080. */
+#define SENSOR_WIDTH                640 /* Balanced preview size: larger than the low-latency experiment, still smaller than full sensor output. */
+#define SENSOR_HEIGHT               320 /* Matches the previously stable preview path used during WiFi tuning. */
 #define CHN0_EN                     1
 #define CHN1_EN                     0
 #define CHN2_EN                     0

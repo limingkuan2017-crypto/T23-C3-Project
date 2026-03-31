@@ -9,6 +9,7 @@ set -e
 #   这是 T23 rebuild 的应用层入口脚本，负责决定当前进入哪种“应用模式”：
 #   1. camera_diag
 #   2. isp_uartd
+#   3. isp_bridge
 #
 # 设计目标:
 #   - 同一份镜像可以切换不同诊断模式
@@ -32,6 +33,8 @@ fi
 #   继续沿用原来的相机诊断流程
 # isp_uartd:
 #   自动进入串口 ISP 调参模式，适合直接配合浏览器页面使用
+# isp_bridge:
+#   进入“UART 控制 + SPI 传图”的桥接模式，供 C3 WiFi 方案使用
 APP_MODE=${APP_MODE:-camera_diag}
 
 # CAMERA_MODE 控制 camera 诊断程序运行哪种模式。
@@ -47,9 +50,14 @@ USE_DATA_PARTITION=${USE_DATA_PARTITION:-0}
 # 当前诊断程序主要把 JPEG 保存到 /tmp，所以这里默认也是 /tmp。
 TARGET_DIR=${TARGET_DIR:-/tmp}
 
-# isp_uartd 模式下会用到的串口参数。
-UART_DEV=${UART_DEV:-/dev/ttyS1}
-UART_BAUD=${UART_BAUD:-921600}
+# isp_uartd 模式使用调试串口，默认仍然走 ttyS1。
+ISP_UART_DEV=${ISP_UART_DEV:-${UART_DEV:-/dev/ttyS1}}
+ISP_UART_BAUD=${ISP_UART_BAUD:-${UART_BAUD:-115200}}
+
+# isp_bridge 模式使用连接到 C3 的控制串口。
+# 根据当前硬件图，T23 pin70/71 对应的是 UART0，因此这里默认走 ttyS0。
+BRIDGE_UART_DEV=${BRIDGE_UART_DEV:-/dev/ttyS0}
+BRIDGE_UART_BAUD=${BRIDGE_UART_BAUD:-115200}
 
 # 无论后面是否切换分区，先保证目标目录存在。
 mkdir -p "$TARGET_DIR"
@@ -80,7 +88,11 @@ case "$APP_MODE" in
 		;;
 	"isp_uartd")
 		# 自动切到串口 ISP 调参模式。
-		exec /system/init/start_isp_uartd.sh "${UART_DEV}" "${UART_BAUD}"
+		exec /system/init/start_isp_uartd.sh "${ISP_UART_DEV}" "${ISP_UART_BAUD}"
+		;;
+	"isp_bridge")
+		# 自动切到 C3 桥接模式：控制命令走 UART，图像数据走 SPI。
+		exec /system/bin/t23_isp_bridge --port "${BRIDGE_UART_DEV}" --baud "${BRIDGE_UART_BAUD}"
 		;;
 	*)
 		echo "err: unsupported APP_MODE=${APP_MODE}"
