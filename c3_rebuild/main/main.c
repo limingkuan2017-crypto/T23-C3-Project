@@ -425,10 +425,20 @@ static esp_err_t show_install_guide_pattern(void)
 
     memset(led_rgb, 0, sizeof(led_rgb));
     for (seg = 0; seg < 4; ++seg) {
-        uint8_t r = (segment_lengths[seg] == 16) ? 255 : 0;
+        uint8_t r = 0;
         uint8_t g = 0;
-        uint8_t b = (segment_lengths[seg] == 9) ? 255 : 0;
+        uint8_t b = 0;
         int i;
+
+        /* Highlight only the selected installation start pair:
+         * segment 0 = short edge (blue), segment 1 = following long edge (red).
+         * Remaining segments stay off so customers can identify orientation quickly.
+         */
+        if (seg == 0 && segment_lengths[seg] == 9) {
+            b = 255;
+        } else if (seg == 1 && segment_lengths[seg] == 16) {
+            r = 255;
+        }
 
         for (i = 0; i < segment_lengths[seg]; ++i) {
             led_rgb[(dst_offset + i) * 3 + 0] = r;
@@ -437,7 +447,7 @@ static esp_err_t show_install_guide_pattern(void)
         }
         dst_offset += segment_lengths[seg];
     }
-    ESP_LOGI(TAG, "LED install guide: short edges blue, long edges red (%s)", g_install_mode->name);
+    ESP_LOGI(TAG, "LED install guide: selected short edge blue, selected long edge red (%s)", g_install_mode->name);
     return sm16703sp3_show_rgb(led_rgb, LED_STRIP_COUNT);
 }
 
@@ -641,7 +651,7 @@ static const char g_app_js[] =
     "async function refreshLayout(){log('GET /api/layout');try{const data=await fetchJson('/api/layout');applyLayoutMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function refreshInstallMode(){log('GET /api/install_mode');try{const data=await fetchJson('/api/install_mode');applyInstallModeMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function setLayout(value){log(`GET /api/layout/set?value=${value}`);try{const data=await fetchJson(`/api/layout/set?value=${encodeURIComponent(value)}`);applyLayoutMeta(data);drawBorderBlocks();if(state.mode==='RUN')await refreshRuntimeBlocks();else await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
-    "async function setInstallMode(value){log(`GET /api/install_mode/set?value=${value}`);try{const data=await fetchJson(`/api/install_mode/set?value=${encodeURIComponent(value)}`);applyInstallModeMeta(data);setPreviewStatus(`Install mode ${data.installMode} ready`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function setInstallMode(value){log(`GET /api/install_mode/set?value=${value}`);try{const data=await fetchJson(`/api/install_mode/set?value=${encodeURIComponent(value)}`);applyInstallModeMeta(data);setPreviewStatus(`Install guide updated: ${data.label}`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function showInstallGuide(){log('GET /api/install_guide');try{await fetchJson('/api/install_guide');setPreviewStatus('Install guide shown: short edges blue, long edges red','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshMode(){log('GET /api/mode');try{const data=await fetchJson('/api/mode');setModeUi(data.mode||'DEBUG');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setMode(mode){log(`GET /api/mode/set?value=${mode}`);try{const data=await fetchJson(`/api/mode/set?value=${encodeURIComponent(mode)}`);setModeUi(data.mode||mode);if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';}}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
