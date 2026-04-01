@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "sm16703sp3.h"
 #include "t23_border_pipeline.h"
 #include "t23_c3_protocol.h"
 
@@ -32,6 +33,10 @@
 #define PIN_NUM_CLK 6
 #define PIN_NUM_CS 5
 #define PIN_NUM_DATA_READY 3
+
+#define LED_POWER_EN_GPIO 1
+#define LED_STRIP_GPIO 7
+#define LED_STRIP_COUNT 50
 
 #define T23_UART_PORT UART_NUM_1
 #define T23_UART_TX 19
@@ -61,6 +66,25 @@ typedef struct {
     int left_blocks;
 } border_layout_desc_t;
 
+typedef struct {
+    char layout_name[16];
+    int block_count;
+    int top_blocks;
+    int right_blocks;
+    int bottom_blocks;
+    int left_blocks;
+    int image_w;
+    int image_h;
+    int rect_left;
+    int rect_top;
+    int rect_right;
+    int rect_bottom;
+    int thickness;
+    uint8_t colors[T23_BORDER_BLOCK_COUNT_MAX][3];
+    uint8_t valid[T23_BORDER_BLOCK_COUNT_MAX];
+    int ready;
+} border_blocks_cache_t;
+
 static const bridge_param_t g_params[] = {
     { "BRIGHTNESS", T23_C3_PARAM_BRIGHTNESS },
     { "CONTRAST", T23_C3_PARAM_CONTRAST },
@@ -83,6 +107,7 @@ static volatile c3_mode_t g_c3_mode = C3_MODE_DEBUG;
 static const border_layout_desc_t g_layout_16x9 = { "16X9", 16, 9, 16, 9 };
 static const border_layout_desc_t g_layout_4x3 = { "4X3", 4, 3, 4, 3 };
 static const border_layout_desc_t *g_current_layout = &g_layout_16x9;
+static border_blocks_cache_t g_latest_blocks;
 
 static esp_err_t spi_receive_frame(t23_c3_frame_t *frame, int timeout_ms);
 
@@ -97,6 +122,218 @@ static const border_layout_desc_t *find_layout_desc(const char *name)
         return &g_layout_4x3;
     }
     return &g_layout_16x9;
+}
+
+static void init_led_power_enable(void)
+{
+    const gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << LED_POWER_EN_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(LED_POWER_EN_GPIO, 1));
+    ESP_LOGI(TAG, "LED power enabled on GPIO%d", LED_POWER_EN_GPIO);
+}
+
+static void run_led_self_test(void)
+{
+    ESP_LOGI(TAG, "LED self-test: red");
+    sm16703sp3_fill_rgb(255, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "LED self-test: green");
+    sm16703sp3_fill_rgb(0, 255, 0);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "LED self-test: blue");
+    sm16703sp3_fill_rgb(0, 0, 255);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "LED self-test: white");
+    sm16703sp3_fill_rgb(255, 255, 255);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "LED self-test: off");
+    sm16703sp3_clear();
+}
+
+static void reset_blocks_cache(border_blocks_cache_t *cache)
+{
+    memset(cache, 0, sizeof(*cache));
+    snprintf(cache->layout_name, sizeof(cache->layout_name), "%s", g_layout_16x9.name);
+    cache->top_blocks = g_layout_16x9.top_blocks;
+    cache->right_blocks = g_layout_16x9.right_blocks;
+    cache->bottom_blocks = g_layout_16x9.bottom_blocks;
+    cache->left_blocks = g_layout_16x9.left_blocks;
+    cache->block_count = cache->top_blocks + cache->right_blocks + cache->bottom_blocks + cache->left_blocks;
+}
+
+/*
+ * Copy the latest block result into a single in-memory cache used by both the
+ * web UI and the LED runtime path. Centralizing this copy keeps DEBUG and RUN
+ * modes consistent.
+ */
+static void store_latest_blocks(const char *layout_name,
+                                int block_count,
+                                int top_blocks,
+                                int right_blocks,
+                                int bottom_blocks,
+                                int left_blocks,
+                                int image_w,
+                                int image_h,
+                                int rect_left,
+                                int rect_top,
+                                int rect_right,
+                                int rect_bottom,
+                                int thickness,
+                                const int blocks[T23_BORDER_BLOCK_COUNT_MAX][3],
+                                const int got_blocks[T23_BORDER_BLOCK_COUNT_MAX])
+{
+    int i;
+
+    reset_blocks_cache(&g_latest_blocks);
+    snprintf(g_latest_blocks.layout_name, sizeof(g_latest_blocks.layout_name), "%s", layout_name ? layout_name : g_layout_16x9.name);
+    g_latest_blocks.block_count = block_count;
+    g_latest_blocks.top_blocks = top_blocks;
+    g_latest_blocks.right_blocks = right_blocks;
+    g_latest_blocks.bottom_blocks = bottom_blocks;
+    g_latest_blocks.left_blocks = left_blocks;
+    g_latest_blocks.image_w = image_w;
+    g_latest_blocks.image_h = image_h;
+    g_latest_blocks.rect_left = rect_left;
+    g_latest_blocks.rect_top = rect_top;
+    g_latest_blocks.rect_right = rect_right;
+    g_latest_blocks.rect_bottom = rect_bottom;
+    g_latest_blocks.thickness = thickness;
+
+    for (i = 0; i < block_count && i < (int)T23_BORDER_BLOCK_COUNT_MAX; ++i) {
+        g_latest_blocks.colors[i][0] = got_blocks[i] ? (uint8_t)blocks[i][0] : 0;
+        g_latest_blocks.colors[i][1] = got_blocks[i] ? (uint8_t)blocks[i][1] : 0;
+        g_latest_blocks.colors[i][2] = got_blocks[i] ? (uint8_t)blocks[i][2] : 0;
+        g_latest_blocks.valid[i] = got_blocks[i] ? 1 : 0;
+    }
+    g_latest_blocks.ready = 1;
+}
+
+static uint16_t run_blocks_checksum16(const uint8_t *data, size_t len)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i < len; ++i) {
+        sum = (sum + data[i]) & 0xffffu;
+    }
+
+    return (uint16_t)sum;
+}
+
+/*
+ * Convert the cached block result into the JSON shape expected by the web UI.
+ * This keeps HTTP handlers lightweight and avoids recomputing layout metadata
+ * on every request.
+ */
+static esp_err_t build_border_blocks_json_from_cache(char *json_buf,
+                                                     size_t json_buf_size,
+                                                     const border_blocks_cache_t *cache)
+{
+    size_t used = 0;
+    int i;
+
+    if (!cache->ready || cache->block_count <= 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    used += (size_t)snprintf(json_buf + used,
+                             json_buf_size - used,
+                             "{\"ok\":true,\"layout\":\"%s\",\"blockCount\":%d,\"topBlocks\":%d,\"rightBlocks\":%d,\"bottomBlocks\":%d,\"leftBlocks\":%d,\"imageWidth\":%d,\"imageHeight\":%d,\"rect\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d,\"thickness\":%d},\"blocks\":[",
+                             cache->layout_name,
+                             cache->block_count,
+                             cache->top_blocks,
+                             cache->right_blocks,
+                             cache->bottom_blocks,
+                             cache->left_blocks,
+                             cache->image_w,
+                             cache->image_h,
+                             cache->rect_left,
+                             cache->rect_top,
+                             cache->rect_right,
+                             cache->rect_bottom,
+                             cache->thickness);
+
+    for (i = 0; i < cache->block_count; ++i) {
+        used += (size_t)snprintf(json_buf + used,
+                                 json_buf_size - used,
+                                 "%s{\"index\":%d,\"r\":%u,\"g\":%u,\"b\":%u}",
+                                 (i == 0) ? "" : ",",
+                                 i,
+                                 cache->valid[i] ? cache->colors[i][0] : 0,
+                                 cache->valid[i] ? cache->colors[i][1] : 0,
+                                 cache->valid[i] ? cache->colors[i][2] : 0);
+        if (used >= json_buf_size) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (snprintf(json_buf + used, json_buf_size - used, "]}") >= (int)(json_buf_size - used)) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+static void expand_block_segment(uint8_t *led_rgb,
+                                 int dst_offset,
+                                 int dst_count,
+                                 const border_blocks_cache_t *cache,
+                                 int src_offset,
+                                 int src_count)
+{
+    int i;
+
+    if (dst_count <= 0 || src_count <= 0) {
+        return;
+    }
+
+    for (i = 0; i < dst_count; ++i) {
+        int src_index = src_offset + ((i * src_count) / dst_count);
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+
+        if (src_index >= 0 && src_index < cache->block_count && cache->valid[src_index]) {
+            r = cache->colors[src_index][0];
+            g = cache->colors[src_index][1];
+            b = cache->colors[src_index][2];
+        }
+
+        led_rgb[(dst_offset + i) * 3 + 0] = r;
+        led_rgb[(dst_offset + i) * 3 + 1] = g;
+        led_rgb[(dst_offset + i) * 3 + 2] = b;
+    }
+}
+
+/*
+ * Expand the logical border layout into the fixed 50-pixel physical LED strip
+ * order and push the result to the SM16703SP3 driver.
+ */
+static esp_err_t update_led_strip_from_cache(const border_blocks_cache_t *cache)
+{
+    uint8_t led_rgb[LED_STRIP_COUNT * 3];
+    int top_offset = 0;
+    int right_offset = cache->top_blocks;
+    int bottom_offset = right_offset + cache->right_blocks;
+    int left_offset = bottom_offset + cache->bottom_blocks;
+
+    if (!cache->ready || cache->block_count <= 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memset(led_rgb, 0, sizeof(led_rgb));
+    expand_block_segment(led_rgb, 0, 16, cache, top_offset, cache->top_blocks);
+    expand_block_segment(led_rgb, 16, 9, cache, right_offset, cache->right_blocks);
+    expand_block_segment(led_rgb, 25, 16, cache, bottom_offset, cache->bottom_blocks);
+    expand_block_segment(led_rgb, 41, 9, cache, left_offset, cache->left_blocks);
+    return sm16703sp3_show_rgb(led_rgb, LED_STRIP_COUNT);
 }
 
 static const char g_index_html[] =
@@ -266,7 +503,7 @@ static const char g_app_js[] =
     "function waitForImage(img){if(img.complete&&img.naturalWidth>0)return Promise.resolve();return new Promise((resolve,reject)=>{const onLoad=()=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);resolve();};const onError=(e)=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);reject(e);};img.addEventListener('load',onLoad,{once:true});img.addEventListener('error',onError,{once:true});});}\n"
     "function applyLayoutMeta(data){if(!data)return;const layout=data.layout||state.layout||'16X9';state.layout=layout;if(ui.layoutSelect&&ui.layoutSelect.value!==layout)ui.layoutSelect.value=layout;}\n"
     "function getLayoutMeta(d){const top=d.topBlocks||16,right=d.rightBlocks||9,bottom=d.bottomBlocks||16,left=d.leftBlocks||9;return{top,right,bottom,left,total:(d.blockCount||d.blocks?.length||0),layout:(d.layout||state.layout||'16X9')};}\n"
-    "function setModeUi(mode){state.mode=mode;ui.modeBadge.textContent=`Mode: ${mode}`;const isRun=mode==='RUN';ui.originalPane.classList.toggle('is-hidden',isRun);ui.ispPanel.classList.toggle('is-hidden',isRun);ui.calibrationPanel.classList.toggle('is-hidden',isRun);ui.snapBtn.disabled=isRun;ui.enterRunBtn.disabled=isRun;ui.returnDebugBtn.disabled=!isRun;if(isRun){setPreviewStatus('Run mode active','good');}else{setPreviewStatus('Debug mode active','good');}}\n"
+    "function setModeUi(mode){state.mode=mode;ui.modeBadge.textContent=`Mode: ${mode}`;const isRun=mode==='RUN';ui.originalPane.classList.toggle('is-hidden',isRun);ui.ispPanel.classList.toggle('is-hidden',isRun);ui.calibrationPanel.classList.toggle('is-hidden',isRun);ui.snapBtn.disabled=isRun;ui.autoPreviewBtn.disabled=isRun;ui.enterRunBtn.disabled=isRun;ui.returnDebugBtn.disabled=!isRun;if(isRun){setPreviewStatus('Run mode active: LED output only','good');}else{setPreviewStatus('Debug mode active','good');}}\n"
     "function renderParams(){ui.paramGrid.innerHTML='';for(const p of PARAMS){const card=document.createElement('article');card.className='param-card';card.innerHTML=`<header><label for=\"slider-${p.key}\">${p.label}</label><span class=\"value\" id=\"value-${p.key}\">-</span></header><input id=\"slider-${p.key}\" type=\"range\" min=\"${p.min}\" max=\"${p.max}\" step=\"${p.step}\" value=\"${p.min}\"><div class=\"param-actions\"><button id=\"apply-${p.key}\">Apply</button><button id=\"read-${p.key}\">Read</button></div>`;ui.paramGrid.appendChild(card);const slider=document.getElementById(`slider-${p.key}`);const value=document.getElementById(`value-${p.key}`);document.getElementById(`apply-${p.key}`).onclick=()=>setParam(p.key,slider.value,true);document.getElementById(`read-${p.key}`).onclick=()=>refreshValues();slider.oninput=()=>{value.textContent=slider.value;};slider.onchange=()=>setParam(p.key,slider.value,true);p.slider=slider;p.valueLabel=value;}}\n"
     "function applyValues(data){for(const p of PARAMS){if(typeof data[p.key]!=='undefined'){p.slider.value=data[p.key];p.valueLabel.textContent=data[p.key];}}}\n"
     "function makeDefaultCalibration(w,h){const left=Math.round(w/8),right=Math.round(w-left),top=Math.round(h/8),bottom=Math.round(h-top),cx=Math.round(w/2),cy=Math.round(h/2);return{imageWidth:w,imageHeight:h,points:[{x:left,y:top},{x:cx,y:top},{x:right,y:top},{x:right,y:cy},{x:right,y:bottom},{x:cx,y:bottom},{x:left,y:bottom},{x:left,y:cy}]};}\n"
@@ -287,7 +524,7 @@ static const char g_app_js[] =
     "async function refreshLayout(){log('GET /api/layout');try{const data=await fetchJson('/api/layout');applyLayoutMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function setLayout(value){log(`GET /api/layout/set?value=${value}`);try{const data=await fetchJson(`/api/layout/set?value=${encodeURIComponent(value)}`);applyLayoutMeta(data);drawBorderBlocks();if(state.mode==='RUN')await refreshRuntimeBlocks();else await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshMode(){log('GET /api/mode');try{const data=await fetchJson('/api/mode');setModeUi(data.mode||'DEBUG');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
-    "async function setMode(mode){log(`GET /api/mode/set?value=${mode}`);try{const data=await fetchJson(`/api/mode/set?value=${encodeURIComponent(mode)}`);setModeUi(data.mode||mode);if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';}if(mode==='RUN'){startAutoPreview();}}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function setMode(mode){log(`GET /api/mode/set?value=${mode}`);try{const data=await fetchJson(`/api/mode/set?value=${encodeURIComponent(mode)}`);setModeUi(data.mode||mode);if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';}}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshValues(){setPreviewStatus('Refreshing parameters...','busy');log('GET /api/params');try{const data=await fetchJson('/api/params');applyValues(data);setPreviewStatus('Parameters refreshed','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function pingT23(){log('GET /api/ping');try{await fetchJson('/api/ping');setPreviewStatus('T23 online','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setParam(key,value,autoSnap){log(`GET /api/set?key=${key}&value=${value}`);try{const data=await fetchJson(`/api/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`);applyValues(data);setPreviewStatus(`Applied ${key}`,'good');if(autoSnap){await refreshPreviewAndBlocks();}}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
@@ -295,7 +532,7 @@ static const char g_app_js[] =
     "async function refreshRuntimeBlocks(){if(state.runtimeBusy)return;state.runtimeBusy=true;log('GET /api/runtime_blocks');try{state.borderData=await fetchJson('/api/runtime_blocks');applyLayoutMeta(state.borderData);drawBorderBlocks();setPreviewStatus('Run mode blocks updated','good');}catch(e){log(`ERR ${e.message}`);if(String(e.message).includes('HTTP 500'))setPreviewStatus('Run mode warming up...','busy');else setPreviewStatus(`ERR ${e.message}`,'bad');}finally{state.runtimeBusy=false;}}\n"
     "async function captureSnapshot(){if(state.previewBusy)return false;state.previewBusy=true;setPreviewStatus('Capturing snapshot...','busy');const url=`/api/snap?t=${Date.now()}`;log(`GET ${url}`);try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();if(state.previewUrl)URL.revokeObjectURL(state.previewUrl);state.previewUrl=URL.createObjectURL(blob);ui.previewImage.src=state.previewUrl;await waitForImage(ui.previewImage);setPreviewStatus('Preview updated','good');return true;}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');return false;}finally{state.previewBusy=false;}}\n"
     "async function refreshPreviewAndBlocks(){const ok=await captureSnapshot();if(ok)await refreshBorderBlocks();}\n"
-    "function startAutoPreview(){if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';setPreviewStatus('Auto preview stopped');return;}const runner=(state.mode==='RUN')?refreshRuntimeBlocks:refreshPreviewAndBlocks;runner();state.autoPreviewTimer=setInterval(()=>runner(),state.mode==='RUN'?120:280);ui.autoPreviewBtn.textContent='Stop Auto Preview';setPreviewStatus(state.mode==='RUN'?'Run mode refresh active':'Auto preview running','good');}\n"
+    "function startAutoPreview(){if(state.mode==='RUN'){setPreviewStatus('Run mode disables web preview for lowest latency','good');return;}if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';setPreviewStatus('Auto preview stopped');return;}const runner=refreshPreviewAndBlocks;runner();state.autoPreviewTimer=setInterval(()=>runner(),280);ui.autoPreviewBtn.textContent='Stop Auto Preview';setPreviewStatus('Auto preview running','good');}\n"
     "ui.refreshBtn.onclick=refreshValues;ui.pingBtn.onclick=pingT23;ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.loadCalibrationBtn.onclick=loadCalibration;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();pingT23().then(refreshMode).then(refreshLayout).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});\n";
 
 static void post_setup_cb(spi_slave_transaction_t *trans)
@@ -399,6 +636,116 @@ static int uart_read_line(char *buf, size_t buf_size, int timeout_ms)
         ESP_LOGI(TAG, "UART << %s", buf);
     }
     return (int)len;
+}
+
+static int uart_read_exact(uint8_t *buf, size_t len, int timeout_ms)
+{
+    size_t received = 0;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+
+    while (received < len) {
+        TickType_t now = xTaskGetTickCount();
+        int remain_ms;
+        int ret;
+
+        if (now >= deadline) {
+            break;
+        }
+
+        remain_ms = (int)((deadline - now) * portTICK_PERIOD_MS);
+        if (remain_ms < 1) {
+            remain_ms = 1;
+        }
+
+        ret = uart_read_bytes(T23_UART_PORT, buf + received, len - received, pdMS_TO_TICKS(remain_ms > 20 ? 20 : remain_ms));
+        if (ret > 0) {
+            received += (size_t)ret;
+        }
+    }
+
+    return (int)received;
+}
+
+/*
+ * Receive one high-speed RUN frame from T23. Frames are binary and fixed-size,
+ * so the C3 can update LEDs without any ASCII parsing in the hot path.
+ */
+static esp_err_t bridge_receive_runtime_blocks_frame_locked(void)
+{
+    t23_c3_run_blocks_frame_t frame;
+    uint8_t first;
+    uint8_t second;
+
+    while (1) {
+        if (uart_read_exact(&first, 1, 150) != 1) {
+            return ESP_ERR_TIMEOUT;
+        }
+        if (first != T23_C3_RUN_MAGIC0) {
+            continue;
+        }
+        if (uart_read_exact(&second, 1, 50) != 1) {
+            return ESP_ERR_TIMEOUT;
+        }
+        if (second != T23_C3_RUN_MAGIC1) {
+            continue;
+        }
+
+        memset(&frame, 0, sizeof(frame));
+        frame.magic0 = first;
+        frame.magic1 = second;
+        if (uart_read_exact(((uint8_t *)&frame) + 2, sizeof(frame) - 2, 100) != (int)(sizeof(frame) - 2)) {
+            return ESP_ERR_TIMEOUT;
+        }
+
+        if (frame.version != T23_C3_RUN_STREAM_VERSION) {
+            continue;
+        }
+        if (frame.block_count == 0 || frame.block_count > T23_BORDER_BLOCK_COUNT_MAX) {
+            continue;
+        }
+        if (run_blocks_checksum16((const uint8_t *)&frame, sizeof(frame) - sizeof(frame.checksum)) != frame.checksum) {
+            ESP_LOGW(TAG, "runtime frame checksum mismatch");
+            continue;
+        }
+
+        {
+            int blocks[T23_BORDER_BLOCK_COUNT_MAX][3];
+            int valid[T23_BORDER_BLOCK_COUNT_MAX];
+            int i;
+            const border_layout_desc_t *layout = (frame.layout == T23_BORDER_LAYOUT_4X3) ? &g_layout_4x3 : &g_layout_16x9;
+
+            for (i = 0; i < frame.block_count; ++i) {
+                blocks[i][0] = frame.blocks[i].r;
+                blocks[i][1] = frame.blocks[i].g;
+                blocks[i][2] = frame.blocks[i].b;
+                valid[i] = 1;
+            }
+
+            store_latest_blocks(layout->name,
+                                frame.block_count,
+                                frame.top_blocks,
+                                frame.right_blocks,
+                                frame.bottom_blocks,
+                                frame.left_blocks,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                blocks,
+                                valid);
+            g_current_layout = layout;
+            if (build_border_blocks_json_from_cache(g_latest_border_json, sizeof(g_latest_border_json), &g_latest_blocks) == ESP_OK) {
+                g_latest_border_json_valid = 1;
+            } else {
+                g_latest_border_json_valid = 0;
+            }
+        }
+
+        return ESP_OK;
+    }
 }
 
 static esp_err_t init_t23_uart(void)
@@ -800,6 +1147,21 @@ static esp_err_t bridge_get_border_blocks(char *json_buf, size_t json_buf_size)
                                  got_blocks[i] ? blocks[i][2] : 0);
     }
     snprintf(json_buf + used, json_buf_size - used, "]}");
+    store_latest_blocks(layout_name,
+                        block_count,
+                        top_blocks,
+                        right_blocks,
+                        bottom_blocks,
+                        left_blocks,
+                        image_w,
+                        image_h,
+                        rect_left,
+                        rect_top,
+                        rect_right,
+                        rect_bottom,
+                        thickness,
+                        blocks,
+                        got_blocks);
     return ESP_OK;
 }
 
@@ -1016,6 +1378,21 @@ static esp_err_t bridge_fetch_frame_locked(uint8_t *jpeg_buf,
     }
 
     g_latest_border_json_valid = 1;
+    store_latest_blocks(layout_name,
+                        block_count,
+                        top_blocks,
+                        right_blocks,
+                        bottom_blocks,
+                        left_blocks,
+                        image_w,
+                        image_h,
+                        rect_left,
+                        rect_top,
+                        rect_right,
+                        rect_bottom,
+                        thickness,
+                        blocks,
+                        got_blocks);
     *jpeg_len_out = received;
     return ESP_OK;
 }
@@ -1303,6 +1680,12 @@ static size_t choose_preview_capacity(void)
     return 0;
 }
 
+/*
+ * Background task for RUN mode. While RUN is active it continuously receives
+ * block frames from T23 and immediately refreshes the LED strip. DEBUG mode
+ * parks this task so the web UI can keep using the slower request/response
+ * bridge safely.
+ */
 static void runtime_blocks_task(void *arg)
 {
     (void)arg;
@@ -1310,12 +1693,25 @@ static void runtime_blocks_task(void *arg)
     while (1) {
         if (g_c3_mode == C3_MODE_RUN) {
             if (xSemaphoreTake(g_bridge_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-                if (bridge_get_border_blocks(g_latest_border_json, sizeof(g_latest_border_json)) == ESP_OK) {
-                    g_latest_border_json_valid = 1;
+                esp_err_t ret = bridge_receive_runtime_blocks_frame_locked();
+                border_blocks_cache_t cache_copy;
+
+                if (ret == ESP_OK) {
+                    memcpy(&cache_copy, &g_latest_blocks, sizeof(cache_copy));
                 } else {
-                    g_latest_border_json_valid = 0;
+                    if (ret != ESP_ERR_TIMEOUT) {
+                        ESP_LOGW(TAG, "runtime frame receive failed: %s", esp_err_to_name(ret));
+                    }
+                    reset_blocks_cache(&cache_copy);
                 }
                 xSemaphoreGive(g_bridge_lock);
+
+                if (cache_copy.ready) {
+                    esp_err_t led_ret = update_led_strip_from_cache(&cache_copy);
+                    if (led_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "LED update failed: %s", esp_err_to_name(led_ret));
+                    }
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
@@ -1437,9 +1833,13 @@ static esp_err_t mode_set_handler(httpd_req_t *req)
     ret = bridge_set_mode(target, json, sizeof(json));
     xSemaphoreGive(g_bridge_lock);
     g_latest_border_json_valid = 0;
+    reset_blocks_cache(&g_latest_blocks);
 
     if (ret != ESP_OK) {
         return send_error_json(req, "mode set failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    if (target == C3_MODE_DEBUG) {
+        sm16703sp3_clear();
     }
     return send_json(req, json);
 }
@@ -1629,25 +2029,17 @@ static esp_err_t border_blocks_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+/*
+ * Lightweight RUN status endpoint. The webpage can poll this for a human
+ * friendly summary, but RUN mode itself no longer depends on web polling for
+ * LED updates.
+ */
 static esp_err_t runtime_blocks_handler(httpd_req_t *req)
 {
     char json[4096];
-    esp_err_t ret;
 
     if (!copy_latest_border_json(json, sizeof(json))) {
-        xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
-        ret = bridge_get_border_blocks(json, sizeof(json));
-        if (ret == ESP_OK) {
-            snprintf(g_latest_border_json, sizeof(g_latest_border_json), "%s", json);
-            g_latest_border_json_valid = 1;
-        } else {
-            g_latest_border_json_valid = 0;
-        }
-        xSemaphoreGive(g_bridge_lock);
-
-        if (ret != ESP_OK) {
-            return send_error_json(req, "runtime blocks not ready", HTTPD_500_INTERNAL_SERVER_ERROR);
-        }
+        snprintf(json, sizeof(json), "{\"ok\":true,\"warming\":true,\"layout\":\"%s\",\"blockCount\":0,\"blocks\":[]}", g_current_layout->name);
     }
 
     return send_json(req, json);
@@ -1853,6 +2245,13 @@ void app_main(void)
     init_wifi_sta();
     init_t23_uart();
     init_spi_slave();
+    init_led_power_enable();
+    reset_blocks_cache(&g_latest_blocks);
+    ESP_ERROR_CHECK(sm16703sp3_init(&(sm16703sp3_config_t) {
+        .gpio_num = LED_STRIP_GPIO,
+        .led_count = LED_STRIP_COUNT,
+    }));
+    run_led_self_test();
     if (bridge_get_mode(&initial_mode) == ESP_OK) {
         g_c3_mode = initial_mode;
         ESP_LOGI(TAG, "Initial T23 mode: %s", c3_mode_name(g_c3_mode));

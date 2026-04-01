@@ -106,7 +106,54 @@ T23 的应用模式由：
 
 - `APP_MODE=isp_bridge`
 
-## 6. 当前图像规格
+## 6. 接口总览
+
+为了避免后续查代码时在 UART、SPI、HTTP 三条链路之间来回跳，这里先把接口角色说清楚：
+
+| 接口 | 所在链路 | 当前用途 |
+|---|---|---|
+| `T23 ttyS0 <-> C3 UART1` | 控制 / 运行结果 | `DEBUG` 下传 ASCII 命令；`RUN` 下由 T23 连续推送二进制色块帧 |
+| `T23 spidev0.0 <-> C3 SPI2 slave` | 图像数据 | 仅在 `DEBUG` 下传普通 JPEG 和校正 JPEG |
+| `C3 HTTP` | 网页调试入口 | ISP 参数、校准、模式切换、预览 |
+| `C3 GPIO7` | 灯带数据 | 通过 `RMT` 输出 `SM16703SP3` 单线时序 |
+| `C3 GPIO1` | 灯带电源使能 | 拉高后灯带上电 |
+
+### 6.1 T23 <-> C3 UART 协议
+
+`DEBUG` 模式下，UART 走文本协议。当前常用命令：
+
+| 命令 | 方向 | 作用 |
+|---|---|---|
+| `PING` | C3 -> T23 | 测试控制链是否在线 |
+| `GET ALL` | C3 -> T23 | 读取全部 ISP 参数 |
+| `SET <KEY> <VALUE>` | C3 -> T23 | 修改单个 ISP 参数 |
+| `SNAP` | C3 -> T23 | 请求一张普通 JPEG，图像随后走 SPI |
+| `CAL GET` | C3 -> T23 | 读取保存的 8 点校准数据 |
+| `CAL SET ...` | C3 -> T23 | 写入 8 点校准数据 |
+| `CAL SNAP` | C3 -> T23 | 请求一张 T23 内部校正后的 JPEG，图像随后走 SPI |
+| `BLOCKS GET` | C3 -> T23 | 在 `DEBUG` 下请求一次边框色块结果 |
+| `FRAME` | C3 -> T23 | 在 `DEBUG` 下请求“同一帧原图 + 色块” |
+| `MODE GET / MODE SET ...` | 双向 | 查询或切换 `DEBUG / RUN` |
+| `LAYOUT GET / LAYOUT SET ...` | 双向 | 查询或切换 `16X9 / 4X3` 布局 |
+
+`RUN` 模式下，UART 不再走逐次请求文本协议，而是：
+
+| 数据 | 方向 | 作用 |
+|---|---|---|
+| `t23_c3_run_blocks_frame_t` | T23 -> C3 | 高速二进制色块帧，供灯带实时刷新 |
+
+### 6.2 T23 <-> C3 SPI 协议
+
+SPI 现在只在 `DEBUG` 下使用，负责传图像数据：
+
+| 帧类型 | 作用 |
+|---|---|
+| `RESP_JPEG_INFO` | 告知本次 JPEG 总长度 |
+| `RESP_JPEG_DATA` | JPEG 数据分包 |
+
+这也是当前 `RUN` 之所以更快的关键原因之一：`RUN` 已经不再依赖 SPI 传整图。
+
+## 7. 当前图像规格
 
 当前稳定预览尺寸已经恢复到：
 
@@ -122,9 +169,9 @@ T23 的应用模式由：
 - 是当前调参和网页预览的稳定折中值
 - 后面做边框提取时，实时链路可能不再传整张图，而是只传 ROI 或直接传 50 色块结果
 
-## 7. 构建与烧录
+## 8. 构建与烧录
 
-### 7.1 T23
+### 8.1 T23
 
 重新打包整包镜像：
 
@@ -137,7 +184,7 @@ cd /home/kuan/T23-C3-Project/t23_rebuild
 
 - [T23 整包镜像](/home/kuan/T23-C3-Project/t23_rebuild/_release/image_t23/T23N_gcc540_uclibc_16M_camera_diag.img)
 
-### 7.2 C3
+### 8.2 C3
 
 加载 ESP-IDF 环境：
 
@@ -152,9 +199,9 @@ source ./scripts/idf_env.sh
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-## 8. 成功启动时应该看到什么
+## 9. 成功启动时应该看到什么
 
-### 8.1 T23
+### 9.1 T23
 
 关键日志：
 
@@ -166,7 +213,7 @@ t23_isp_bridge start
 serial device: /dev/ttyS0
 ```
 
-### 8.2 C3
+### 9.2 C3
 
 关键日志：
 
@@ -177,7 +224,7 @@ WiFi got IP: 192.168.x.x
 HTTP server started on port 80
 ```
 
-## 9. 当前网页功能
+## 10. 当前网页功能
 
 当前网页由 C3 内嵌提供，访问：
 
@@ -208,7 +255,7 @@ http://<C3-IP>/
   - 拖动 8 个点并保存到 T23
   - 右侧显示由 T23 内部完成 8 点拉正后回传的真实校正预览图
 
-## 10. 当前校正算法说明
+## 11. 当前校正算法说明
 
 这一节只说明“校准预览图”是怎么在 T23 内部算出来的。它对应代码：
 
@@ -219,7 +266,7 @@ http://<C3-IP>/
 - `handle_cal_snap()`
 - `rectify_jpeg_from_calibration()`
 
-### 10.1 输入是什么
+### 11.1 输入是什么
 
 当前算法输入有两部分：
 
@@ -241,7 +288,7 @@ http://<C3-IP>/
 
 - [t23_border_pipeline.h](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_border_pipeline.h)
 
-### 10.2 整体流程
+### 11.2 整体流程
 
 当前校正流程是：
 
@@ -262,7 +309,7 @@ http://<C3-IP>/
 - `UART` 只传控制命令
 - `SPI` 只传图像数据
 
-### 10.3 当前几何映射怎么做
+### 11.3 当前几何映射怎么做
 
 当前不是简单四点透视，而是“8 点边界曲线 + 曲面插值”的做法。
 
@@ -287,7 +334,7 @@ http://<C3-IP>/
 - 比单纯 4 角透视更适合“边有弯曲”的情况
 - 4 个边中点可以参与修正边缘弯曲
 
-### 10.4 为什么现在输出图是 16:9
+### 11.4 为什么现在输出图是 16:9
 
 当前版本的校正图不再强行保持原图尺寸，而是直接输出一个标准 `16:9` 的电视矩形。
 
@@ -304,7 +351,7 @@ http://<C3-IP>/
 
 这样做的目的，是让后续的边框划分始终建立在统一的电视坐标系上，而不是跟随原始图像尺寸变化。
 
-### 10.5 当前算法不是在做什么
+### 11.5 当前算法不是在做什么
 
 当前版本虽然叫“真实校正预览”，但它还不是最终产品算法。
 
@@ -319,7 +366,7 @@ http://<C3-IP>/
 
 - 先把“8 点标定 -> T23 内部校正 -> 网页看到校正结果”这条链打通
 
-### 10.6 这个算法为什么适合后续 50 区域
+### 11.6 这个算法为什么适合后续 50 区域
 
 因为后面的真正目标不是显示整图，而是：
 
@@ -333,7 +380,7 @@ http://<C3-IP>/
 - `16 / 9 / 16 / 9` 的 50 个区域可以用固定规则切分
 - 灯带映射不需要再关心相机原始画面的大小
 
-### 10.7 当前边框色块划分规则
+### 11.7 当前边框色块划分规则
 
 当前第一版边框划分已经支持两种布局：
 
@@ -372,7 +419,7 @@ http://<C3-IP>/
 
 这样定义的目的，是让边框块在逻辑上围成一圈，后面更容易直接映射到灯带顺序。网页上的布局选择会通过 `C3 -> UART -> T23` 切换底层算法，而不是只改变前端显示。
 
-### 10.8 当前平均颜色算法
+### 11.8 当前平均颜色算法
 
 当前颜色算法是最简单、最稳定的第一版：
 
@@ -400,9 +447,9 @@ http://<C3-IP>/
 - 去高光/去异常值的裁剪均值
 - 中值滤波
 - 时间上的平滑滤波
-## 11. 当前代码主流程
+## 12. 当前代码主流程
 
-### 11.1 T23 启动脚本调用顺序
+### 12.1 T23 启动脚本调用顺序
 
 | 调用顺序 | 名称 | 功能 |
 |---|---|---|
@@ -411,7 +458,7 @@ http://<C3-IP>/
 | 3 | `app_main.sh` | 根据 `APP_MODE` 选择运行 `camera_diag / isp_uartd / isp_bridge` |
 | 4 | `t23_isp_bridge` | 在 `isp_bridge` 模式下启动 T23 的控制桥和 JPEG 发送逻辑 |
 
-### 11.2 T23 `isp_bridge` 关键函数顺序表
+### 12.2 T23 `isp_bridge` 关键函数顺序表
 
 文件：
 
@@ -419,33 +466,35 @@ http://<C3-IP>/
 
 | 调用顺序 | 函数名称 | 具体功能 |
 |---|---|---|
-| 1 | `main` | 程序入口，解析串口参数、注册信号、启动整条桥接流程 |
+| 1 | `main` | 程序入口，解析参数并决定进入 `DEBUG` 轮询还是 `RUN` 流模式 |
 | 2 | `parse_args` | 解析 `--port` 和 `--baud` 参数 |
-| 3 | `open_serial_port` | 打开 T23 侧控制串口，当前默认 `/dev/ttyS0` |
-| 4 | `startup_pipeline` | 初始化 ISP、Framesource、JPEG Encoder，并让视频链跑起来 |
-| 5 | `make_sensor_cfg` | 组装当前传感器配置结构体 |
+| 3 | `open_serial_port` | 打开控制串口 `/dev/ttyS0`，配置为非阻塞 |
+| 4 | `startup_pipeline` | 初始化 T23 图像链：IMP 系统、视频源、JPEG 编码器 |
+| 5 | `make_sensor_cfg` | 组装当前传感器配置 |
 | 6 | `sample_system_init` | 初始化 IMP 系统 |
 | 7 | `sample_framesource_init` | 初始化视频源通道 |
 | 8 | `create_groups` | 创建编码 group |
 | 9 | `sample_jpeg_init` | 初始化 JPEG 编码通道 |
 | 10 | `bind_jpeg_channels` | 绑定 Framesource 与 Encoder |
 | 11 | `sample_framesource_streamon` | 打开视频流 |
-| 12 | `start_jpeg_recv_once` | 启动 JPEG 接收，让编码器持续产出 JPEG |
-| 13 | `read_line` | 从 UART 读一条来自 C3 的控制命令 |
-| 14 | `process_command` | 解析并分发 `PING / GET / SET / SNAP / CAL GET / CAL SET / CAL SNAP` |
-| 15 | `send_all_values` | 返回当前全部 ISP 参数 |
-| 16 | `send_calibration` | 返回当前保存在 T23 内部的 8 点校准数据 |
-| 17 | `handle_cal_set` | 接收并保存网页提交的 8 点标定结果 |
-| 18 | `handle_snap` | 生成一张最新 JPEG，并准备通过 SPI 发送给 C3 |
-| 19 | `handle_cal_snap` | 生成一张真实校正预览图，并通过 SPI 回给 C3 |
-| 20 | `capture_jpeg_once` | 从当前编码队列中取最新一帧 JPEG，丢弃旧帧 |
-| 21 | `rectify_jpeg_from_calibration` | 在 T23 内部解 JPEG、按 8 点做拉正、再重新编码成 JPEG |
-| 22 | `push_jpeg_over_spi` | 把一张 JPEG 按协议拆包通过 SPI 发送出去 |
-| 23 | `push_one_spi_frame` | 发送一包 SPI 数据 |
-| 24 | `sendf` / `send_line` | 通过 UART 把文本响应回给 C3 |
-| 25 | `shutdown_pipeline` | 程序退出时关闭视频流、解绑并释放 IMP 资源 |
+| 12 | `start_jpeg_recv_once` | 让编码器持续接收图片，后续随取随用 |
+| 13 | `poll_serial_commands_nonblocking` | 非阻塞轮询 DEBUG 命令，避免卡住运行循环 |
+| 14 | `process_command` | 分发 `PING / GET / SET / SNAP / CAL / MODE / LAYOUT / FRAME / BLOCKS GET` |
+| 15 | `handle_snap` | 抓一张普通 JPEG，并通过 SPI 发给 C3 |
+| 16 | `handle_cal_snap` | 生成真实校正预览 JPEG，并通过 SPI 发给 C3 |
+| 17 | `handle_frame_with_blocks` | 在同一帧上同时产出原图 JPEG 和边框色块，供 DEBUG 同步显示 |
+| 18 | `handle_blocks_get` | 在 DEBUG 下按请求返回一次文本色块结果 |
+| 19 | `capture_jpeg_once` | 从编码队列里取最新 JPEG，并丢掉旧帧 |
+| 20 | `compute_border_blocks_from_calibration` | 运行时色块核心算法：用反映射直接从原图取样平均，不再先生成整张校正图 |
+| 21 | `rectify_jpeg_from_calibration` | 仅给 DEBUG 校准预览使用，生成真实的校正后 JPEG |
+| 22 | `send_run_blocks_frame` | 把一帧色块结果打包成二进制高速帧 |
+| 23 | `build_runtime_blocks_frame_from_current` | 生成当前 RUN 色块帧 |
+| 24 | `run_mode_loop` | RUN 主循环，持续流式推送二进制色块帧 |
+| 25 | `push_jpeg_over_spi` | 按共享协议分包发送 JPEG |
+| 26 | `sendf / send_line` | 通过 UART 回文本响应 |
+| 27 | `shutdown_pipeline` | 关闭视频流并释放 IMP 资源 |
 
-### 11.3 C3 `bridge` 关键函数顺序表
+### 12.3 C3 `bridge` 关键函数顺序表
 
 文件：
 
@@ -453,33 +502,73 @@ http://<C3-IP>/
 
 | 调用顺序 | 函数名称 | 具体功能 |
 |---|---|---|
-| 1 | `app_main` | C3 固件入口，初始化 NVS、网络、UART、SPI、HTTP |
-| 2 | `init_wifi_sta` | 以 STA 模式连接路由器 |
-| 3 | `wifi_event_handler` | 处理 WiFi 连接、断开、获取 IP 等事件 |
-| 4 | `init_t23_uart` | 初始化连接 T23 的 UART1 |
-| 5 | `init_spi_slave` | 初始化 SPI Slave 和 `Data Ready` 引脚 |
-| 6 | `start_http_server` | 启动 HTTP 服务器并注册网页和 API 路由 |
-| 7 | `index_handler` | 返回网页 HTML |
-| 8 | `styles_handler` | 返回网页 CSS |
-| 9 | `app_js_handler` | 返回网页 JS |
-| 10 | `ping_handler` | 调用 `/api/ping`，测试 T23 控制链 |
-| 11 | `params_handler` | 调用 `/api/params`，读取全部 ISP 参数 |
-| 12 | `set_handler` | 调用 `/api/set`，修改单个 ISP 参数 |
-| 13 | `snap_handler` | 调用 `/api/snap`，抓一张最新 JPEG |
-| 14 | `calibration_get_handler` | 调用 `/api/calibration`，读取 T23 里保存的 8 点数据 |
-| 15 | `calibration_set_handler` | 调用 `/api/calibration/set`，把 8 点数据写回 T23 |
-| 16 | `calibration_rectified_handler` | 调用 `/api/calibration/rectified`，读取 T23 内部真正拉正后的图 |
-| 17 | `bridge_ping` | 通过 UART 向 T23 发 `PING` |
-| 18 | `bridge_get_all` | 通过 UART 向 T23 发 `GET ALL` 并组装 JSON |
-| 19 | `bridge_set_param` | 通过 UART 向 T23 发 `SET key value` |
-| 20 | `bridge_fetch_snapshot_locked_ex` | 按命令类型请求一张 JPEG，并通过 SPI 收完整图像 |
-| 21 | `spi_receive_frame` | 接收单包 SPI 数据 |
-| 22 | `uart_send_line` | 向 T23 发送一条 UART 文本命令 |
-| 23 | `uart_read_line` | 读取一条来自 T23 的 UART 文本响应 |
+| 1 | `app_main` | C3 固件入口，初始化 NVS、WiFi、UART、SPI、HTTP、灯带 |
+| 2 | `init_led_power_enable` | 拉高 `GPIO1`，给灯带上电 |
+| 3 | `sm16703sp3_init` | 初始化 `GPIO7` 上的 RMT 灯带输出 |
+| 4 | `run_led_self_test` | 上电自检灯带颜色顺序 |
+| 5 | `init_wifi_sta` | 以 STA 模式连接路由器 |
+| 6 | `wifi_event_handler` | 处理 WiFi 连接、断开、获取 IP |
+| 7 | `init_t23_uart` | 初始化连接 T23 的 UART1 |
+| 8 | `init_spi_slave` | 初始化 SPI Slave，仅供 DEBUG 图像链使用 |
+| 9 | `start_http_server` | 启动网页和所有 API 路由 |
+| 10 | `runtime_blocks_task` | RUN 后台任务，持续接收 T23 推送的二进制色块帧并刷新灯带 |
+| 11 | `bridge_receive_runtime_blocks_frame_locked` | 解析一帧二进制 RUN 色块帧 |
+| 12 | `store_latest_blocks` | 把最新色块统一保存到缓存，供网页和灯带复用 |
+| 13 | `update_led_strip_from_cache` | 把逻辑色块扩展成 50 颗实体灯珠并发送到 SM16703SP3 |
+| 14 | `root_handler / app_js_handler / styles_handler` | 返回网页 HTML/JS/CSS |
+| 15 | `mode_get_handler / mode_set_handler` | 查询或切换 `DEBUG / RUN` |
+| 16 | `layout_get_handler / layout_set_handler` | 查询或切换 `16X9 / 4X3` |
+| 17 | `params_handler / set_handler` | 读取和设置 ISP 参数 |
+| 18 | `snap_handler` | 走 DEBUG 链抓普通 JPEG |
+| 19 | `calibration_get_handler / calibration_set_handler / calibration_rectified_handler` | 校准相关接口 |
+| 20 | `border_blocks_handler` | 在 DEBUG 下返回一次色块 JSON |
+| 21 | `runtime_blocks_handler` | 在 RUN 下返回轻量状态/缓存结果，网页不再依赖它驱动灯带 |
+| 22 | `bridge_fetch_frame_locked` | DEBUG 同帧抓图和色块同步链路 |
+| 23 | `bridge_fetch_snapshot_locked_ex` | 按命令类型请求 JPEG 并通过 SPI 收图 |
+| 24 | `uart_send_line / uart_read_line` | DEBUG 文本协议的 UART 发送与接收 |
 
-## 12. 当前最重要的共享头文件
+## 13. 关键函数索引
 
-### 12.1 SPI / 控制协议
+这一节不是按模块介绍，而是按“阅读和排错最常查的函数”整理，方便你直接搜索。
+
+### 13.1 T23 `isp_bridge` 最常查函数
+
+| 函数 | 功能 |
+|---|---|
+| `startup_pipeline` | 启动 T23 图像采集与 JPEG 编码链 |
+| `capture_jpeg_once` | 取最新 JPEG，并尽量丢掉旧帧 |
+| `compute_border_blocks_from_calibration` | RUN 模式下根据校准结果直接反映射取样并输出色块 |
+| `rectify_jpeg_from_calibration` | DEBUG 校准预览用，生成真实校正图 |
+| `handle_frame_with_blocks` | DEBUG 下一次性返回原图和色块，保证两边预览同帧 |
+| `send_run_blocks_frame` | 发送 RUN 二进制色块帧 |
+| `run_mode_loop` | RUN 持续流式主循环 |
+| `process_command` | 所有 UART 文本命令的总入口 |
+
+### 13.2 C3 `main` 最常查函数
+
+| 函数 | 功能 |
+|---|---|
+| `runtime_blocks_task` | RUN 模式后台接收色块流并刷新灯带 |
+| `bridge_receive_runtime_blocks_frame_locked` | 解析 T23 推送的二进制色块帧 |
+| `store_latest_blocks` | 保存最新色块缓存，供网页/灯带复用 |
+| `update_led_strip_from_cache` | 将逻辑布局扩展成 50 颗物理灯珠 |
+| `bridge_fetch_frame_locked` | DEBUG 下抓同一帧原图和色块 |
+| `snap_handler` | 普通预览抓图接口 |
+| `mode_set_handler` | `DEBUG / RUN` 切换入口 |
+| `layout_set_handler` | `16X9 / 4X3` 布局切换入口 |
+
+### 13.3 灯带驱动最常查函数
+
+| 函数 | 功能 |
+|---|---|
+| `sm16703sp3_init` | 初始化 RMT 灯带驱动 |
+| `sm16703sp3_show_rgb` | 发送一整帧 RGB 数据 |
+| `sm16703sp3_fill_rgb` | 用于自检，整条灯带填充单色 |
+| `sm16703sp3_clear` | 熄灭整条灯带 |
+
+## 14. 当前最重要的共享头文件
+
+### 14.1 SPI / 控制协议
 
 - [t23_c3_protocol.h](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
 
@@ -489,7 +578,7 @@ http://<C3-IP>/
 - 定义 SPI 固定帧格式
 - 定义 JPEG 分包头
 
-### 12.2 边框提取数据结构
+### 14.2 边框提取数据结构
 
 - [t23_border_pipeline.h](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_border_pipeline.h)
 
@@ -502,7 +591,7 @@ http://<C3-IP>/
   - 边框几何信息
   - 50 色块结果
 
-## 13. 之后的真正目标：边框提取
+## 15. 之后的真正目标：边框提取
 
 后续不建议继续把主要精力放在“整张 JPEG 看起来像视频”上，而是应该切到更接近产品形态的链路：
 
@@ -523,16 +612,90 @@ http://<C3-IP>/
 
 总数正好 50。
 
-## 14. 当前最常用的命令
+## 16. 当前灯带控制链路
 
-### 14.1 T23 打包
+当前灯带芯片是 `SM16703SP3`，控制方式按 `WS2811` 兼容时序处理。
+
+实现位置：
+
+- [sm16703sp3.h](/home/kuan/T23-C3-Project/c3_rebuild/components/sm16703sp3/sm16703sp3.h)
+- [sm16703sp3.c](/home/kuan/T23-C3-Project/c3_rebuild/components/sm16703sp3/sm16703sp3.c)
+- [c3 bridge main.c](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
+
+当前设计：
+
+- 灯带数据输出由 `C3` 完成
+- 输出引脚是 `IO7`
+- 使用 `RMT` 单线发送，不占用已经给 `T23` 图像链使用的 `SPI2_HOST`
+- 实体灯珠数量按 `50` 颗处理
+
+为什么不用参考工程里的 `ws2811` SPI 写法：
+
+- 参考实现：
+  - [ws2811.h](/home/kuan/programs/esp32-i2s-sr/components/ws2811/ws2811.h)
+  - [ws2811.c](/home/kuan/programs/esp32-i2s-sr/components/ws2811/ws2811.c)
+- 它本质上是用 `SPI master` 伪造灯带波形
+- 但当前项目里 `SPI2_HOST` 已经被 `T23 <-> C3` 图像链占用
+- 所以本项目改成 `RMT` 输出，更适合当前架构
+
+当前灯带刷新流程：
+
+1. `T23` 在 `RUN` 模式下持续计算边框平均色
+2. `T23` 通过 `UART0 -> C3 UART1` 持续推送紧凑二进制色块帧
+3. `C3` 后台任务 `runtime_blocks_task()` 连续接收色块帧并更新缓存
+4. `C3` 把色块展开成 50 颗物理灯珠颜色
+5. `C3` 通过 `IO7` 把数据发给 `SM16703SP3`
+
+`RUN` 模式和 `DEBUG` 模式的主要区别：
+
+- `DEBUG`
+  - 仍然是网页优先的调试链路
+  - `UART` 走 ASCII 命令协议
+  - 支持 ISP 调参、抓拍、校准、校正图预览
+- `RUN`
+  - 不再走 `BLOCKS GET` 这种逐次请求-响应文本协议
+  - `T23` 进入持续输出模式
+  - `C3` 只负责接收色块流、缓存并直接刷新灯带
+  - 网页默认不再实时拉取预览，避免影响最低延迟
+  - 这样可以明显减少文本解析、往返等待和网页轮询带来的延迟
+
+当前 `RUN` 模式下的色块算法已经不再是“每帧先生成整张校正图，再从校正图切块”，而是：
+
+1. `DEBUG` 模式完成一次 8 点校准
+2. `RUN` 模式每帧直接抓当前图像
+3. 对每个目标色块区域，在逻辑上的校正矩形坐标里取样
+4. 通过反映射（`Coons Patch`）把这些采样点映射回原始图像
+5. 直接在原始图像上做双线性采样并求平均色
+
+这样保留了校准结果，但去掉了每帧整图校正的额外开销，更适合低延迟灯带控制。
+
+布局映射规则：
+
+- `16x9` 布局
+  - 与 50 颗实体灯珠一一对应
+  - 上 `16`、右 `9`、下 `16`、左 `9`
+- `4x3` 布局
+  - 仍然输出到同一条 50 灯珠物理分布
+  - 只是把 `4/3/4/3` 的粗块颜色按比例展开到 `16/9/16/9`
+  - 例如：
+    - 上边 `4` 块会扩展到 `16` 颗灯
+    - 右边 `3` 块会扩展到 `9` 颗灯
+
+这意味着：
+
+- `DEBUG` 模式下你可以继续看网页预览
+- `RUN` 模式下即使网页不开，灯带也会持续刷新
+
+## 17. 当前最常用的命令
+
+### 17.1 T23 打包
 
 ```sh
 cd /home/kuan/T23-C3-Project/t23_rebuild
 ./scripts/package_flash_image.sh
 ```
 
-### 14.2 C3 刷机
+### 17.2 C3 刷机
 
 ```sh
 cd /home/kuan/T23-C3-Project/c3_rebuild
@@ -540,7 +703,7 @@ source ./scripts/idf_env.sh
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-### 14.3 切换 T23 串口内核配置
+### 17.3 切换 T23 串口内核配置
 
 ```sh
 cd /home/kuan/T23-C3-Project
@@ -553,7 +716,7 @@ cd /home/kuan/T23-C3-Project
 ./scripts/apply_t23_kernel_serial_profile.sh t23_vendor_hw
 ```
 
-## 15. 你现在最应该看哪些文件
+## 18. 你现在最应该看哪些文件
 
 如果只看 6 个文件，建议按这个顺序：
 

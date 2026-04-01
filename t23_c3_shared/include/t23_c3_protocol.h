@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "t23_border_pipeline.h"
+
 /*
  * Shared protocol between:
  * - T23 Linux userspace (SPI master)
@@ -100,5 +102,34 @@ typedef struct __attribute__((packed)) {
 #define T23_C3_SPI_TEST_RESP1 0xA5u
 #define T23_C3_SPI_TEST_RESP2 0xEEu
 #define T23_C3_SPI_TEST_RESP3 0xDDu
+
+#define T23_C3_RUN_MAGIC0 0x52u /* 'R' */
+#define T23_C3_RUN_MAGIC1 0x42u /* 'B' */
+#define T23_C3_RUN_STREAM_VERSION 0x01u
+
+/*
+ * High-speed runtime frame used only in RUN mode.
+ *
+ * Key idea:
+ * - DEBUG mode keeps the human-readable ASCII command flow for ISP tuning,
+ *   calibration, and preview.
+ * - RUN mode switches to this fixed-size binary packet so T23 can continuously
+ *   stream the latest border colors to C3 with minimal parsing overhead.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t magic0;
+    uint8_t magic1;
+    uint8_t version;
+    uint8_t layout;
+    uint8_t top_blocks;
+    uint8_t right_blocks;
+    uint8_t bottom_blocks;
+    uint8_t left_blocks;
+    uint8_t block_count;
+    uint8_t reserved;
+    uint16_t seq;
+    t23_rgb8_t blocks[T23_BORDER_BLOCK_COUNT_MAX];
+    uint16_t checksum;
+} t23_c3_run_blocks_frame_t;
 
 #endif

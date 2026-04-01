@@ -10,6 +10,14 @@
 4. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
 5. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
 
+总指南里现在已经统一包含：
+
+- 接口总览
+- `DEBUG / RUN` 模式差异
+- 关键调用顺序表
+- 关键函数功能表
+- 当前校正算法与灯带链路说明
+
 ## 目录说明
 
 - [t23_rebuild](/home/kuan/T23-C3-Project/t23_rebuild)

@@ -82,11 +82,13 @@ static int g_data_ready_fd = -1;
 static t23_border_calibration_t g_calibration;
 static bridge_mode_t g_bridge_mode = BRIDGE_MODE_DEBUG;
 static t23_border_layout_t g_border_layout = T23_BORDER_LAYOUT_16X9;
+static uint16_t g_run_frame_seq = 1;
 
 static void send_line(int fd, const char *line);
 static void sendf(int fd, const char *fmt, ...);
 static int capture_jpeg_once(unsigned char *out_buf, size_t *out_len);
 static int push_jpeg_over_spi(const unsigned char *jpeg_buf, size_t jpeg_len);
+static void process_command(int fd, char *line);
 
 static const char *bridge_mode_name(bridge_mode_t mode)
 {
@@ -679,6 +681,67 @@ static void compute_average_rect(const unsigned char *rgb,
     out->b = (uint8_t)(b_sum / count);
 }
 
+static void compute_average_rectified_patch(const unsigned char *src_rgb,
+                                            int src_w,
+                                            int src_h,
+                                            const pointf_t pts[T23_BORDER_POINT_COUNT],
+                                            int dst_w,
+                                            int dst_h,
+                                            int left,
+                                            int top,
+                                            int right,
+                                            int bottom,
+                                            t23_rgb8_t *out)
+{
+    unsigned long long r_sum = 0;
+    unsigned long long g_sum = 0;
+    unsigned long long b_sum = 0;
+    unsigned long long count = 0;
+    int x;
+    int y;
+
+    left = clamp_int(left, 0, dst_w - 1);
+    right = clamp_int(right, 0, dst_w - 1);
+    top = clamp_int(top, 0, dst_h - 1);
+    bottom = clamp_int(bottom, 0, dst_h - 1);
+    if (right < left) {
+        right = left;
+    }
+    if (bottom < top) {
+        bottom = top;
+    }
+
+    for (y = top; y <= bottom; ++y) {
+        for (x = left; x <= right; ++x) {
+            double u = (dst_w > 1) ? (double)x / (double)(dst_w - 1) : 0.0;
+            double v = (dst_h > 1) ? (double)y / (double)(dst_h - 1) : 0.0;
+            pointf_t src = coons_patch_point(pts, u, v);
+
+            r_sum += bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 0);
+            g_sum += bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 1);
+            b_sum += bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 2);
+            ++count;
+        }
+    }
+
+    if (count == 0) {
+        out->r = 0;
+        out->g = 0;
+        out->b = 0;
+        return;
+    }
+
+    out->r = (uint8_t)(r_sum / count);
+    out->g = (uint8_t)(g_sum / count);
+    out->b = (uint8_t)(b_sum / count);
+}
+
+/*
+ * Compute all border block averages directly from the original JPEG frame by
+ * inverse mapping through the saved calibration model. This is the optimized
+ * runtime path used by RUN mode, and avoids building a full rectified image for
+ * every frame.
+ */
 static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
                                                   size_t src_jpeg_len,
                                                   t23_border_layout_t layout_id,
@@ -697,7 +760,10 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
                                                   int *thickness_out)
 {
     const border_layout_desc_t *layout = get_border_layout_desc(layout_id);
-    unsigned char *dst_rgb = NULL;
+    unsigned char *src_rgb = NULL;
+    pointf_t pts[T23_BORDER_POINT_COUNT];
+    int src_w = 0;
+    int src_h = 0;
     int image_w = 0;
     int image_h = 0;
     int rect_left = 0;
@@ -710,17 +776,16 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
     unsigned int idx = 0;
     unsigned int i;
 
-    if (build_rectified_rgb_from_calibration(src_jpeg,
-                                             src_jpeg_len,
-                                             &dst_rgb,
-                                             &image_w,
-                                             &image_h,
-                                             &rect_left,
-                                             &rect_top,
-                                             &rect_right,
-                                             &rect_bottom) < 0) {
+    if (decode_jpeg_to_rgb888(src_jpeg, (unsigned long)src_jpeg_len, &src_rgb, &src_w, &src_h) < 0) {
         return -1;
     }
+
+    scaled_calibration_points(&g_calibration, src_w, src_h, pts);
+    compute_rectified_size(pts, &image_w, &image_h);
+    rect_left = 0;
+    rect_top = 0;
+    rect_right = image_w - 1;
+    rect_bottom = image_h - 1;
 
     rect_w = rect_right - rect_left + 1;
     rect_h = rect_bottom - rect_top + 1;
@@ -731,7 +796,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int x1 = rect_left + (int)((long long)rect_w * (i + 1) / layout->top_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rect(dst_rgb, image_w, image_h, x0, rect_top, x1, rect_top + thickness - 1, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, x0, rect_top, x1, rect_top + thickness - 1, &blocks[idx].color);
         ++idx;
     }
 
@@ -740,7 +805,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int y1 = rect_top + (int)((long long)rect_h * (i + 1) / layout->right_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rect(dst_rgb, image_w, image_h, rect_right - thickness + 1, y0, rect_right, y1, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, rect_right - thickness + 1, y0, rect_right, y1, &blocks[idx].color);
         ++idx;
     }
 
@@ -749,7 +814,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int x1 = rect_left + (int)((long long)rect_w * (layout->bottom_blocks - i) / layout->bottom_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rect(dst_rgb, image_w, image_h, x0, rect_bottom - thickness + 1, x1, rect_bottom, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, x0, rect_bottom - thickness + 1, x1, rect_bottom, &blocks[idx].color);
         ++idx;
     }
 
@@ -758,11 +823,11 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int y1 = rect_top + (int)((long long)rect_h * (layout->left_blocks - i) / layout->left_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rect(dst_rgb, image_w, image_h, rect_left, y0, rect_left + thickness - 1, y1, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, rect_left, y0, rect_left + thickness - 1, y1, &blocks[idx].color);
         ++idx;
     }
 
-    free(dst_rgb);
+    free(src_rgb);
     *block_count_out = idx;
     *top_blocks_out = layout->top_blocks;
     *right_blocks_out = layout->right_blocks;
@@ -811,6 +876,138 @@ static void send_border_blocks(int fd,
               blocks[i].color.b);
     }
     send_line(fd, "OK BLOCKS GET");
+}
+
+static uint16_t run_blocks_checksum16(const uint8_t *data, size_t len)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i < len; ++i) {
+        sum = (sum + data[i]) & 0xffffu;
+    }
+
+    return (uint16_t)sum;
+}
+
+/*
+ * Write a complete binary frame to UART even if the file descriptor is
+ * temporarily not ready. RUN mode uses this helper to stream compact color
+ * packets to the C3.
+ */
+static int write_full(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+
+    while (len > 0) {
+        ssize_t written = write(fd, p, len);
+
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            }
+            return -1;
+        }
+        p += (size_t)written;
+        len -= (size_t)written;
+    }
+
+    return 0;
+}
+
+/*
+ * Serialize one runtime block result into the shared binary frame format. The
+ * C3 can parse this frame without any string processing.
+ */
+static int send_run_blocks_frame(int fd,
+                                 const border_layout_desc_t *layout,
+                                 const t23_border_block_t blocks[T23_BORDER_BLOCK_COUNT_MAX],
+                                 unsigned int block_count)
+{
+    t23_c3_run_blocks_frame_t frame;
+    size_t i;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.magic0 = T23_C3_RUN_MAGIC0;
+    frame.magic1 = T23_C3_RUN_MAGIC1;
+    frame.version = T23_C3_RUN_STREAM_VERSION;
+    frame.layout = (uint8_t)layout->layout;
+    frame.top_blocks = (uint8_t)layout->top_blocks;
+    frame.right_blocks = (uint8_t)layout->right_blocks;
+    frame.bottom_blocks = (uint8_t)layout->bottom_blocks;
+    frame.left_blocks = (uint8_t)layout->left_blocks;
+    frame.block_count = (uint8_t)block_count;
+    frame.seq = g_run_frame_seq++;
+
+    for (i = 0; i < block_count && i < T23_BORDER_BLOCK_COUNT_MAX; ++i) {
+        frame.blocks[i] = blocks[i].color;
+    }
+
+    frame.checksum = run_blocks_checksum16((const uint8_t *)&frame, sizeof(frame) - sizeof(frame.checksum));
+    return write_full(fd, &frame, sizeof(frame));
+}
+
+/*
+ * Capture the latest image, compute the current border block colors, and emit
+ * one binary runtime frame. This is the core work unit of RUN mode.
+ */
+static int build_runtime_blocks_frame_from_current(int fd)
+{
+    size_t jpeg_len = 0;
+    const border_layout_desc_t *layout = get_border_layout_desc(g_border_layout);
+    t23_border_block_t blocks[T23_BORDER_BLOCK_COUNT_MAX];
+    unsigned int block_count = 0;
+    unsigned int top_blocks = 0;
+    unsigned int right_blocks = 0;
+    unsigned int bottom_blocks = 0;
+    unsigned int left_blocks = 0;
+    int image_w = 0;
+    int image_h = 0;
+    int rect_left = 0;
+    int rect_top = 0;
+    int rect_right = 0;
+    int rect_bottom = 0;
+    int thickness = 0;
+
+    if (capture_jpeg_once(g_jpeg_buf, &jpeg_len) < 0) {
+        return -1;
+    }
+
+    if (compute_border_blocks_from_calibration(g_jpeg_buf,
+                                               jpeg_len,
+                                               g_border_layout,
+                                               blocks,
+                                               &block_count,
+                                               &top_blocks,
+                                               &right_blocks,
+                                               &bottom_blocks,
+                                               &left_blocks,
+                                               &image_w,
+                                               &image_h,
+                                               &rect_left,
+                                               &rect_top,
+                                               &rect_right,
+                                               &rect_bottom,
+                                               &thickness) < 0) {
+        return -1;
+    }
+
+    (void)top_blocks;
+    (void)right_blocks;
+    (void)bottom_blocks;
+    (void)left_blocks;
+    (void)image_w;
+    (void)image_h;
+    (void)rect_left;
+    (void)rect_top;
+    (void)rect_right;
+    (void)rect_bottom;
+    (void)thickness;
+    return send_run_blocks_frame(fd, layout, blocks, block_count);
 }
 
 static void handle_blocks_get(int fd)
@@ -1068,6 +1265,10 @@ static int startup_pipeline(void)
     return 0;
 }
 
+/*
+ * Release IMP pipeline resources in reverse order. Keeping teardown in one
+ * place makes shutdown and mode switching behavior easier to follow.
+ */
 static void shutdown_pipeline(void)
 {
     stop_jpeg_recv_once();
@@ -1133,9 +1334,10 @@ static int parse_args(int argc, char *argv[], bridge_cfg_t *cfg)
 static int open_serial_port(const char *device, speed_t baud_rate)
 {
     int fd;
+    int flags;
     struct termios tio;
 
-    fd = open(device, O_RDWR | O_NOCTTY);
+    fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         perror("open serial");
         return -1;
@@ -1157,6 +1359,11 @@ static int open_serial_port(const char *device, speed_t baud_rate)
         perror("tcsetattr");
         close(fd);
         return -1;
+    }
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 
     tcflush(fd, TCIOFLUSH);
@@ -1196,6 +1403,9 @@ static int read_line(int fd, char *buf, size_t buf_size)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
             return -1;
         }
         if (ch == '\r') {
@@ -1212,6 +1422,96 @@ static int read_line(int fd, char *buf, size_t buf_size)
         printf("bridge rx: %s\n", buf);
     }
     return (int)len;
+}
+
+/*
+ * DEBUG mode still uses the original line-oriented UART command protocol.
+ * Polling through a persistent buffer lets the process stay responsive without
+ * blocking the runtime loop on every read.
+ */
+static int poll_serial_commands_nonblocking(int fd, char *buf, size_t buf_size, size_t *len_io)
+{
+    size_t len = *len_io;
+
+    while (g_running) {
+        char ch;
+        ssize_t ret = read(fd, &ch, 1);
+
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            return -1;
+        }
+        if (ret == 0) {
+            break;
+        }
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            if (len > 0) {
+                buf[len] = '\0';
+                printf("bridge rx: %s\n", buf);
+                process_command(fd, buf);
+                len = 0;
+            }
+            continue;
+        }
+        if (len + 1 < buf_size) {
+            buf[len++] = ch;
+        } else {
+            len = 0;
+        }
+    }
+
+    *len_io = len;
+    return 0;
+}
+
+/*
+ * High-speed RUN loop:
+ * - opportunistically service incoming ASCII control commands
+ * - if mode is still RUN, compute one block frame from the latest image
+ * - immediately stream the binary frame to the C3
+ *
+ * This removes the older request/response latency from the runtime path.
+ */
+static void run_mode_loop(int fd)
+{
+    char cmd_buf[UART_RX_BUF_SIZE];
+    size_t cmd_len = 0;
+    int stream_failures = 0;
+
+    memset(cmd_buf, 0, sizeof(cmd_buf));
+
+    while (g_running && g_bridge_mode == BRIDGE_MODE_RUN) {
+        if (poll_serial_commands_nonblocking(fd, cmd_buf, sizeof(cmd_buf), &cmd_len) < 0) {
+            perror("poll_serial_commands_nonblocking");
+            break;
+        }
+        if (!g_running || g_bridge_mode != BRIDGE_MODE_RUN) {
+            break;
+        }
+
+        if (build_runtime_blocks_frame_from_current(fd) < 0) {
+            ++stream_failures;
+            if (stream_failures < 5 || (stream_failures % 20) == 0) {
+                fprintf(stderr, "run_mode stream frame failed (%d)\n", stream_failures);
+            }
+            usleep(5000);
+        } else {
+            stream_failures = 0;
+        }
+
+        if (poll_serial_commands_nonblocking(fd, cmd_buf, sizeof(cmd_buf), &cmd_len) < 0) {
+            perror("poll_serial_commands_nonblocking");
+            break;
+        }
+    }
 }
 
 static int get_brightness_value(int *value)
@@ -2024,7 +2324,8 @@ int main(int argc, char *argv[])
 {
     bridge_cfg_t cfg;
     int serial_fd;
-    char line[UART_RX_BUF_SIZE];
+    char cmd_buf[UART_RX_BUF_SIZE];
+    size_t cmd_len = 0;
 
     if (parse_args(argc, argv, &cfg) < 0) {
         return 2;
@@ -2049,19 +2350,18 @@ int main(int argc, char *argv[])
     }
 
     send_line(serial_fd, "READY T23_ISP_BRIDGE 1");
+    memset(cmd_buf, 0, sizeof(cmd_buf));
 
     while (g_running) {
-        int ret = read_line(serial_fd, line, sizeof(line));
-
-        if (ret == 0) {
-            usleep(10000);
+        if (g_bridge_mode == BRIDGE_MODE_RUN) {
+            run_mode_loop(serial_fd);
             continue;
         }
-        if (ret < 0) {
-            perror("read_line");
+        if (poll_serial_commands_nonblocking(serial_fd, cmd_buf, sizeof(cmd_buf), &cmd_len) < 0) {
+            perror("poll_serial_commands_nonblocking");
             break;
         }
-        process_command(serial_fd, line);
+        usleep(10000);
     }
 
     close(serial_fd);
