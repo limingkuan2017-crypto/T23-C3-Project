@@ -1,2 +1,3 @@
 sensor:sc2337p
+sensor_param:sensor_max_fps=30 data_interface=1
 isp_param:isp_clk=125000000

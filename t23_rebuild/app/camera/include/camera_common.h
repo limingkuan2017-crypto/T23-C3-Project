@@ -34,7 +34,7 @@ extern "C"
 #endif /* __cplusplus */
 
 /* Sensor frame rate expressed as NUM / DEN. */
-#define SENSOR_FRAME_RATE_NUM        25
+#define SENSOR_FRAME_RATE_NUM        30
 #define SENSOR_FRAME_RATE_DEN        1
 
 /*

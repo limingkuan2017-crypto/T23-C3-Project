@@ -8,6 +8,8 @@ SDK_LIB_DIR := $(SDK_ROOT)/sdk/lib/uclibc
 VENDOR_REF ?= $(REPO_ROOT)/third_party/vendor_reference
 TOOLCHAIN_BIN ?= $(VENDOR_REF)/build/toolchain/mips-gcc540-glibc222-64bit-r3.3.0.smaller/bin
 SHARED_INC_DIR := $(REPO_ROOT)/t23_c3_shared/include
+JPEG_INC_DIR := $(VENDOR_REF)/project/_sdk/jpeglib/include
+JPEG_LIB_DIR := $(VENDOR_REF)/project/_sdk/jpeglib/lib
 
 ifeq ($(wildcard $(TOOLCHAIN_BIN)/mips-linux-gnu-gcc),)
 CROSS_COMPILE ?= mips-linux-gnu-
@@ -32,13 +34,13 @@ CFLAGS = -O2 -Wall -Wextra -march=mips32r2
 ifeq ($(CONFIG_UCLIBC_BUILD),y)
 CFLAGS += -muclibc
 endif
-CFLAGS += -Iinclude -I../camera/include -I$(SDK_INC_DIR) -I$(SHARED_INC_DIR)
+CFLAGS += -Iinclude -I../camera/include -I$(SDK_INC_DIR) -I$(SHARED_INC_DIR) -I$(JPEG_INC_DIR)
 
 LDFLAGS = -Wl,-gc-sections
 ifeq ($(CONFIG_UCLIBC_BUILD),y)
 LDFLAGS += -muclibc
 endif
-LIBS = $(SDK_LIB_DIR)/libimp.a $(SDK_LIB_DIR)/libalog.a -lpthread -lm -lrt -ldl
+LIBS = $(SDK_LIB_DIR)/libimp.a $(SDK_LIB_DIR)/libalog.a $(JPEG_LIB_DIR)/libjpeg.a -lpthread -lm -lrt -ldl
 
 .PHONY: all clean
 
