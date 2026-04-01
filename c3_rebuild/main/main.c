@@ -25,8 +25,13 @@
 
 #define TAG "c3_bridge"
 
-#define WIFI_STA_SSID "MK"
-#define WIFI_STA_PASS "12345678"
+#define WIFI_DEFAULT_SSID "MK"
+#define WIFI_DEFAULT_PASS "12345678"
+#define WIFI_AP_SSID "T23-C3-Setup"
+#define WIFI_AP_PASS "12345678"
+#define WIFI_SCAN_MAX_RESULTS 20
+#define WIFI_SSID_MAX_LEN 32
+#define WIFI_PASS_MAX_LEN 64
 
 #define C3_SPI_HOST SPI2_HOST
 #define PIN_NUM_MOSI 10
@@ -131,6 +136,11 @@ static char g_latest_border_json[4096];
 static int g_latest_border_json_valid;
 static volatile c3_mode_t g_c3_mode = C3_MODE_DEBUG;
 static int g_install_setup_active = 1;
+static char g_wifi_sta_ssid[WIFI_SSID_MAX_LEN + 1];
+static char g_wifi_sta_pass[WIFI_PASS_MAX_LEN + 1];
+static char g_wifi_sta_ip[16];
+static int g_wifi_sta_configured = 1;
+static int g_wifi_sta_connected = 0;
 static const border_layout_desc_t g_layout_16x9 = { "16X9", 16, 9, 16, 9 };
 static const border_layout_desc_t g_layout_4x3 = { "4X3", 4, 3, 4, 3 };
 static const border_layout_desc_t *g_current_layout = &g_layout_16x9;
@@ -154,6 +164,7 @@ static const led_install_desc_t g_install_right_bottom = {
 static const led_install_desc_t *g_install_mode = &g_install_left_top;
 
 static esp_err_t spi_receive_frame(t23_c3_frame_t *frame, int timeout_ms);
+static esp_err_t wifi_apply_sta_config(void);
 
 static const char *c3_mode_name(c3_mode_t mode)
 {
@@ -245,6 +256,61 @@ static esp_err_t save_install_config(void)
     ret = nvs_set_u8(nvs, "install_mode", install_mode_to_u8(g_install_mode));
     if (ret == ESP_OK) {
         ret = nvs_set_u8(nvs, "install_active", g_install_setup_active ? 1 : 0);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+
+    nvs_close(nvs);
+    return ret;
+}
+
+static void load_wifi_config(void)
+{
+    nvs_handle_t nvs = 0;
+    size_t len = 0;
+    uint8_t configured = 1;
+
+    snprintf(g_wifi_sta_ssid, sizeof(g_wifi_sta_ssid), "%s", WIFI_DEFAULT_SSID);
+    snprintf(g_wifi_sta_pass, sizeof(g_wifi_sta_pass), "%s", WIFI_DEFAULT_PASS);
+    g_wifi_sta_configured = 1;
+
+    if (nvs_open("c3cfg", NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+
+    len = sizeof(g_wifi_sta_ssid);
+    if (nvs_get_str(nvs, "wifi_ssid", g_wifi_sta_ssid, &len) != ESP_OK) {
+        snprintf(g_wifi_sta_ssid, sizeof(g_wifi_sta_ssid), "%s", WIFI_DEFAULT_SSID);
+    }
+
+    len = sizeof(g_wifi_sta_pass);
+    if (nvs_get_str(nvs, "wifi_pass", g_wifi_sta_pass, &len) != ESP_OK) {
+        snprintf(g_wifi_sta_pass, sizeof(g_wifi_sta_pass), "%s", WIFI_DEFAULT_PASS);
+    }
+
+    if (nvs_get_u8(nvs, "wifi_cfg", &configured) == ESP_OK) {
+        g_wifi_sta_configured = configured ? 1 : 0;
+    }
+
+    nvs_close(nvs);
+}
+
+static esp_err_t save_wifi_config(void)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t ret = nvs_open("c3cfg", NVS_READWRITE, &nvs);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_str(nvs, "wifi_ssid", g_wifi_sta_ssid);
+    if (ret == ESP_OK) {
+        ret = nvs_set_str(nvs, "wifi_pass", g_wifi_sta_pass);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_u8(nvs, "wifi_cfg", g_wifi_sta_configured ? 1 : 0);
     }
     if (ret == ESP_OK) {
         ret = nvs_commit(nvs);
@@ -549,6 +615,25 @@ static const char g_index_html[] =
     "      </div>\n"
     "      <div class=\"connection-card\">\n"
     "        <div class=\"status-row\"><span class=\"status-dot connected\"></span><span id=\"statusText\">Connected to C3 bridge</span><span id=\"modeBadge\" class=\"preview-status\">Mode: DEBUG</span></div>\n"
+    "        <div class=\"wifi-card\">\n"
+    "          <div class=\"section-header section-header--tight\"><h3>WiFi</h3><span id=\"wifiStatusBadge\" class=\"preview-status\">Loading WiFi...</span></div>\n"
+    "          <p id=\"wifiHint\" class=\"subtitle\">Fallback AP: " WIFI_AP_SSID " / " WIFI_AP_PASS "</p>\n"
+    "          <div class=\"button-row\">\n"
+    "            <label for=\"wifiScanSelect\">Nearby WiFi</label>\n"
+    "            <select id=\"wifiScanSelect\"></select>\n"
+    "            <button id=\"wifiScanBtn\">Scan WiFi</button>\n"
+    "          </div>\n"
+    "          <div class=\"button-row\">\n"
+    "            <label for=\"wifiSsidInput\">SSID</label>\n"
+    "            <input id=\"wifiSsidInput\" type=\"text\" maxlength=\"32\" placeholder=\"Select or enter SSID\">\n"
+    "            <label for=\"wifiPassInput\">Key</label>\n"
+    "            <input id=\"wifiPassInput\" type=\"password\" maxlength=\"64\" placeholder=\"Enter password\">\n"
+    "          </div>\n"
+    "          <div class=\"button-row\">\n"
+    "            <button id=\"wifiSaveBtn\">Save WiFi</button>\n"
+    "            <button id=\"wifiForgetBtn\">Forget WiFi</button>\n"
+    "          </div>\n"
+    "        </div>\n"
     "        <div class=\"button-row\">\n"
     "          <label for=\"layoutSelect\">Border Layout</label>\n"
     "          <select id=\"layoutSelect\">\n"
@@ -656,6 +741,9 @@ static const char g_styles_css[] =
     ".connection-card { border: 1px solid var(--line); border-radius: 16px; padding: 16px; background: linear-gradient(180deg, #ffffff, #f4f8f2); }\n"
     ".status-row, .button-row, .section-header { display: flex; align-items: center; gap: 12px; }\n"
     ".section-header { justify-content: space-between; margin-bottom: 16px; }\n"
+    ".section-header--tight { margin-bottom: 8px; }\n"
+    ".wifi-card { margin: 14px 0 16px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: #ffffff; }\n"
+    ".wifi-card h3 { margin: 0; font-size: 18px; }\n"
     ".status-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 5px rgba(184, 59, 45, 0.12); }\n"
     ".status-dot.connected { background: var(--good); box-shadow: 0 0 0 5px rgba(20, 128, 74, 0.12); }\n"
     ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }\n"
@@ -665,7 +753,7 @@ static const char g_styles_css[] =
     ".param-card .value { color: var(--accent); font-weight: 700; }\n"
     ".param-card input[type=\"range\"] { width: 100%; }\n"
     ".param-actions { display: flex; gap: 8px; margin-top: 10px; }\n"
-    "button, select { border-radius: 10px; border: 1px solid var(--line); padding: 10px 12px; font: inherit; }\n"
+    "button, select, input { border-radius: 10px; border: 1px solid var(--line); padding: 10px 12px; font: inherit; }\n"
     "button { cursor: pointer; background: #fff; }\n"
     "button:hover:enabled { border-color: var(--accent); }\n"
     "button:disabled { opacity: 0.5; cursor: not-allowed; }\n"
@@ -697,14 +785,16 @@ static const char g_app_js[] =
     " {key:'AWB_CT',label:'AWB Color Temp',min:1500,max:12000,step:10}\n"
     "];\n"
     "const POINT_LABELS=['TL','TM','TR','RM','BR','BM','BL','LM'];\n"
-    "const ui={snapBtn:document.getElementById('snapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),layoutSelect:document.getElementById('layoutSelect'),installModeSelect:document.getElementById('installModeSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),loadCalibrationBtn:document.getElementById('loadCalibrationBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
-    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',installMode:'LEFT_TOP',installGuideActive:true,lastBlocksAt:0,defaultsLoaded:false,calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
+    "const ui={snapBtn:document.getElementById('snapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),statusText:document.getElementById('statusText'),wifiStatusBadge:document.getElementById('wifiStatusBadge'),wifiHint:document.getElementById('wifiHint'),wifiScanSelect:document.getElementById('wifiScanSelect'),wifiScanBtn:document.getElementById('wifiScanBtn'),wifiSsidInput:document.getElementById('wifiSsidInput'),wifiPassInput:document.getElementById('wifiPassInput'),wifiSaveBtn:document.getElementById('wifiSaveBtn'),wifiForgetBtn:document.getElementById('wifiForgetBtn'),layoutSelect:document.getElementById('layoutSelect'),installModeSelect:document.getElementById('installModeSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),loadCalibrationBtn:document.getElementById('loadCalibrationBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
+    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',installMode:'LEFT_TOP',installGuideActive:true,wifiConfigured:true,wifiConnected:false,wifiSsid:'',wifiIp:'',lastBlocksAt:0,defaultsLoaded:false,calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
     "function log(m){const ts=new Date().toLocaleTimeString();ui.logBox.textContent+=`[${ts}] ${m}\\n`;ui.logBox.scrollTop=ui.logBox.scrollHeight;}\n"
     "function setPreviewStatus(t,k='idle'){ui.previewStatus.textContent=t;ui.previewStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.previewStatus.classList.add('is-busy');else if(k==='good')ui.previewStatus.classList.add('is-good');else if(k==='bad')ui.previewStatus.classList.add('is-bad');}\n"
     "function setCalibrationStatus(t,k='idle'){ui.calibrationStatus.textContent=t;ui.calibrationStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.calibrationStatus.classList.add('is-busy');else if(k==='good')ui.calibrationStatus.classList.add('is-good');else if(k==='bad')ui.calibrationStatus.classList.add('is-bad');}\n"
     "function waitForImage(img){if(img.complete&&img.naturalWidth>0)return Promise.resolve();return new Promise((resolve,reject)=>{const onLoad=()=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);resolve();};const onError=(e)=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);reject(e);};img.addEventListener('load',onLoad,{once:true});img.addEventListener('error',onError,{once:true});});}\n"
     "function applyLayoutMeta(data){if(!data)return;const layout=data.layout||state.layout||'16X9';state.layout=layout;if(ui.layoutSelect&&ui.layoutSelect.value!==layout)ui.layoutSelect.value=layout;}\n"
     "function applyInstallModeMeta(data){if(!data)return;const installMode=data.installMode||state.installMode||'LEFT_TOP';state.installMode=installMode;state.installGuideActive=typeof data.installGuideActive==='boolean'?data.installGuideActive:state.installGuideActive;if(ui.installModeSelect&&ui.installModeSelect.value!==installMode)ui.installModeSelect.value=installMode;if(ui.installModeSelect)ui.installModeSelect.disabled=!state.installGuideActive; if(ui.showInstallGuideBtn){ui.showInstallGuideBtn.textContent=state.installGuideActive?'Finish Install Guide':'Enable Install Guide'; ui.showInstallGuideBtn.classList.toggle('is-good',state.installGuideActive);} }\n"
+    "function applyWifiStatus(data){if(!data)return;state.wifiConfigured=!!data.configured;state.wifiConnected=!!data.connected;state.wifiSsid=data.ssid||'';state.wifiIp=data.ip||'';if(ui.wifiSsidInput&&!ui.wifiSsidInput.matches(':focus'))ui.wifiSsidInput.value=state.wifiSsid;if(ui.wifiStatusBadge){ui.wifiStatusBadge.textContent=state.wifiConnected?`WiFi: ${state.wifiSsid} (${state.wifiIp||'IP pending'})`:(state.wifiConfigured?`Connecting to ${state.wifiSsid||'saved WiFi'}`:'Setup mode');ui.wifiStatusBadge.classList.remove('is-good','is-busy','is-bad');ui.wifiStatusBadge.classList.add(state.wifiConnected?'is-good':'is-busy');}if(ui.statusText)ui.statusText.textContent=state.wifiConnected?`Connected to ${state.wifiSsid}`:`Connected to C3 bridge (${data.apSsid})`;if(ui.wifiHint)ui.wifiHint.textContent=`Fallback AP: ${data.apSsid} / ${data.apPass}`;}\n"
+    "function applyWifiScan(data){if(!ui.wifiScanSelect)return;ui.wifiScanSelect.innerHTML='';const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent=data.results&&data.results.length?`Found ${data.results.length} network(s)`:'No networks found';ui.wifiScanSelect.appendChild(placeholder);for(const item of (data.results||[])){const opt=document.createElement('option');opt.value=item.ssid;opt.textContent=`${item.ssid} (${item.rssi} dBm)`;ui.wifiScanSelect.appendChild(opt);}ui.wifiScanSelect.value='';}\n"
     "function getLayoutMeta(d){const top=d.topBlocks||16,right=d.rightBlocks||9,bottom=d.bottomBlocks||16,left=d.leftBlocks||9;return{top,right,bottom,left,total:(d.blockCount||d.blocks?.length||0),layout:(d.layout||state.layout||'16X9')};}\n"
     "function setModeUi(mode){state.mode=mode;ui.modeBadge.textContent=`Mode: ${mode}`;const isRun=mode==='RUN';ui.originalPane.classList.toggle('is-hidden',isRun);ui.ispPanel.classList.toggle('is-hidden',isRun);ui.calibrationPanel.classList.toggle('is-hidden',isRun);ui.snapBtn.disabled=isRun;ui.autoPreviewBtn.disabled=isRun;ui.enterRunBtn.disabled=isRun;ui.returnDebugBtn.disabled=!isRun;if(isRun){setPreviewStatus('Run mode active: LED output only','good');}else{setPreviewStatus('Debug mode active','good');}}\n"
     "function renderParams(){ui.paramGrid.innerHTML='';for(const p of PARAMS){const card=document.createElement('article');card.className='param-card';card.innerHTML=`<header><label for=\"slider-${p.key}\">${p.label}</label><span class=\"value\" id=\"value-${p.key}\">-</span></header><input id=\"slider-${p.key}\" type=\"range\" min=\"${p.min}\" max=\"${p.max}\" step=\"${p.step}\" value=\"${p.min}\"><div class=\"param-actions\"><button id=\"default-${p.key}\">Restore Default</button></div>`;ui.paramGrid.appendChild(card);const slider=document.getElementById(`slider-${p.key}`);const value=document.getElementById(`value-${p.key}`);const defaultBtn=document.getElementById(`default-${p.key}`);defaultBtn.onclick=()=>restoreDefault(p);slider.oninput=()=>{value.textContent=slider.value;};slider.onchange=()=>setParam(p.key,slider.value,true);p.slider=slider;p.valueLabel=value;p.defaultBtn=defaultBtn;updateDefaultButtonState(p);}}\n"
@@ -727,6 +817,10 @@ static const char g_app_js[] =
     "function resetCalibration(){const w=(state.calibrationImage&&state.calibrationImage.width)||state.calibration.imageWidth||640;const h=(state.calibrationImage&&state.calibrationImage.height)||state.calibration.imageHeight||320;state.calibration=makeDefaultCalibration(w,h);state.rectifiedImage=null;drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus('Calibration points reset','good');}\n"
     "async function saveCalibration(){ensureCalibrationPoints();const q=new URLSearchParams();q.set('iw',state.calibration.imageWidth);q.set('ih',state.calibration.imageHeight);state.calibration.points.forEach((p,i)=>{q.set(`x${i}`,p.x);q.set(`y${i}`,p.y);});const url=`/api/calibration/set?${q.toString()}`;setCalibrationStatus('Saving calibration...','busy');log(`GET ${url}`);try{const data=await fetchJson(url);state.calibration={imageWidth:data.imageWidth,imageHeight:data.imageHeight,points:data.points};drawCalibrationCanvas();state.rectifiedImage=null;drawRectifiedGuide();await loadRectifiedPreview();}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function fetchJson(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json();}\n"
+    "async function refreshWiFiStatus(){log('GET /api/wifi');try{const data=await fetchJson('/api/wifi');applyWifiStatus(data);}catch(e){log(`ERR ${e.message}`);if(ui.wifiStatusBadge){ui.wifiStatusBadge.textContent=`ERR ${e.message}`;ui.wifiStatusBadge.classList.remove('is-good','is-busy');ui.wifiStatusBadge.classList.add('is-bad');}}}\n"
+    "async function scanWiFi(){log('GET /api/wifi/scan');try{const data=await fetchJson('/api/wifi/scan');applyWifiScan(data);setPreviewStatus('WiFi scan complete','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function saveWiFi(){const ssid=(ui.wifiSsidInput.value||'').trim();const key=ui.wifiPassInput.value||'';if(!ssid){setPreviewStatus('Enter SSID first','bad');return;}const url=`/api/wifi/save?ssid=${encodeURIComponent(ssid)}&key=${encodeURIComponent(key)}`;log(`GET /api/wifi/save?ssid=${ssid}`);try{const data=await fetchJson(url);applyWifiStatus(data);ui.wifiPassInput.value='';setPreviewStatus(`WiFi saved: ${ssid}`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function forgetWiFi(){log('GET /api/wifi/forget');try{const data=await fetchJson('/api/wifi/forget');applyWifiStatus(data);ui.wifiPassInput.value='';setPreviewStatus('Saved WiFi cleared; fallback AP only','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshLayout(){log('GET /api/layout');try{const data=await fetchJson('/api/layout');applyLayoutMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function refreshInstallMode(){log('GET /api/install_mode');try{const data=await fetchJson('/api/install_mode');applyInstallModeMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function setLayout(value){log(`GET /api/layout/set?value=${value}`);try{const data=await fetchJson(`/api/layout/set?value=${encodeURIComponent(value)}`);applyLayoutMeta(data);drawBorderBlocks();if(state.mode==='RUN')await refreshRuntimeBlocks();else await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
@@ -742,7 +836,7 @@ static const char g_app_js[] =
     "async function captureSnapshot(){if(state.previewBusy)return false;state.previewBusy=true;setPreviewStatus('Capturing snapshot...','busy');const url=`/api/snap?t=${Date.now()}`;log(`GET ${url}`);try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();if(state.previewUrl)URL.revokeObjectURL(state.previewUrl);state.previewUrl=URL.createObjectURL(blob);ui.previewImage.src=state.previewUrl;await waitForImage(ui.previewImage);setPreviewStatus('Preview updated','good');return true;}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');return false;}finally{state.previewBusy=false;}}\n"
     "async function refreshPreviewAndBlocks(){const ok=await captureSnapshot();if(ok)await refreshBorderBlocks();}\n"
     "function startAutoPreview(){if(state.mode==='RUN'){setPreviewStatus('Run mode disables web preview for lowest latency','good');return;}if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';setPreviewStatus('Auto preview stopped');return;}const runner=refreshPreviewAndBlocks;runner();state.autoPreviewTimer=setInterval(()=>runner(),280);ui.autoPreviewBtn.textContent='Stop Auto Preview';setPreviewStatus('Auto preview running','good');}\n"
-    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.loadCalibrationBtn.onclick=loadCalibration;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});\n";
+    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.wifiScanSelect.onchange=()=>{if(ui.wifiScanSelect.value)ui.wifiSsidInput.value=ui.wifiScanSelect.value;};ui.wifiScanBtn.onclick=scanWiFi;ui.wifiSaveBtn.onclick=saveWiFi;ui.wifiForgetBtn.onclick=forgetWiFi;ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.loadCalibrationBtn.onclick=loadCalibration;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(refreshWiFiStatus).then(scanWiFi).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});setInterval(()=>refreshWiFiStatus(),5000);\n";
 
 static void post_setup_cb(spi_slave_transaction_t *trans)
 {
@@ -761,6 +855,29 @@ static void set_common_headers(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+}
+
+static void json_escape_copy(char *dst, size_t dst_size, const char *src)
+{
+    size_t di = 0;
+    size_t si = 0;
+
+    if (dst_size == 0) {
+        return;
+    }
+
+    while (src != NULL && src[si] != '\0' && di + 1 < dst_size) {
+        char ch = src[si++];
+
+        if ((ch == '\\' || ch == '"') && di + 2 < dst_size) {
+            dst[di++] = '\\';
+            dst[di++] = ch;
+        } else if ((unsigned char)ch >= 0x20) {
+            dst[di++] = ch;
+        }
+    }
+
+    dst[di] = '\0';
 }
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)
@@ -2191,6 +2308,116 @@ static esp_err_t install_guide_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+static esp_err_t wifi_status_handler(httpd_req_t *req)
+{
+    char ssid[128];
+    char ip[32];
+    char json[512];
+
+    json_escape_copy(ssid, sizeof(ssid), g_wifi_sta_ssid);
+    json_escape_copy(ip, sizeof(ip), g_wifi_sta_ip);
+    snprintf(json,
+             sizeof(json),
+             "{\"ok\":true,\"configured\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"apSsid\":\"%s\",\"apPass\":\"%s\"}",
+             g_wifi_sta_configured ? "true" : "false",
+             g_wifi_sta_connected ? "true" : "false",
+             ssid,
+             ip,
+             WIFI_AP_SSID,
+             WIFI_AP_PASS);
+    return send_json(req, json);
+}
+
+static esp_err_t wifi_scan_handler(httpd_req_t *req)
+{
+    wifi_scan_config_t scan_cfg = { 0 };
+    wifi_ap_record_t records[WIFI_SCAN_MAX_RESULTS];
+    uint16_t count = WIFI_SCAN_MAX_RESULTS;
+    char json[4096];
+    size_t len = 0;
+    uint16_t i;
+    esp_err_t ret;
+
+    memset(records, 0, sizeof(records));
+    ret = esp_wifi_scan_start(&scan_cfg, true);
+    if (ret != ESP_OK) {
+        return send_error_json(req, "wifi scan failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    ret = esp_wifi_scan_get_ap_records(&count, records);
+    if (ret != ESP_OK) {
+        return send_error_json(req, "wifi scan read failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    len += snprintf(json + len, sizeof(json) - len, "{\"ok\":true,\"results\":[");
+    for (i = 0; i < count && len + 96 < sizeof(json); ++i) {
+        char ssid[96];
+
+        json_escape_copy(ssid, sizeof(ssid), (const char *)records[i].ssid);
+        len += snprintf(json + len,
+                        sizeof(json) - len,
+                        "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}",
+                        (i == 0) ? "" : ",",
+                        ssid,
+                        records[i].rssi,
+                        records[i].authmode);
+    }
+    snprintf(json + len, sizeof(json) - len, "]}");
+    return send_json(req, json);
+}
+
+static esp_err_t wifi_save_handler(httpd_req_t *req)
+{
+    char query[256];
+    char ssid[WIFI_SSID_MAX_LEN + 1];
+    char key[WIFI_PASS_MAX_LEN + 1];
+    esp_err_t ret;
+
+    memset(ssid, 0, sizeof(ssid));
+    memset(key, 0, sizeof(key));
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return send_error_json(req, "missing wifi query", HTTPD_400_BAD_REQUEST);
+    }
+    if (httpd_query_key_value(query, "ssid", ssid, sizeof(ssid)) != ESP_OK || ssid[0] == '\0') {
+        return send_error_json(req, "missing ssid", HTTPD_400_BAD_REQUEST);
+    }
+    httpd_query_key_value(query, "key", key, sizeof(key));
+
+    snprintf(g_wifi_sta_ssid, sizeof(g_wifi_sta_ssid), "%s", ssid);
+    snprintf(g_wifi_sta_pass, sizeof(g_wifi_sta_pass), "%s", key);
+    g_wifi_sta_configured = 1;
+    g_wifi_sta_connected = 0;
+    g_wifi_sta_ip[0] = '\0';
+
+    ret = save_wifi_config();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "wifi save failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    ret = wifi_apply_sta_config();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "wifi apply failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    esp_wifi_disconnect();
+    esp_wifi_connect();
+    return wifi_status_handler(req);
+}
+
+static esp_err_t wifi_forget_handler(httpd_req_t *req)
+{
+    esp_err_t ret;
+
+    g_wifi_sta_ssid[0] = '\0';
+    g_wifi_sta_pass[0] = '\0';
+    g_wifi_sta_ip[0] = '\0';
+    g_wifi_sta_connected = 0;
+    g_wifi_sta_configured = 0;
+    ret = save_wifi_config();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "wifi forget failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    esp_wifi_disconnect();
+    return wifi_status_handler(req);
+}
+
 static esp_err_t params_handler(httpd_req_t *req)
 {
     esp_err_t ret;
@@ -2407,6 +2634,30 @@ static esp_err_t start_http_server(void)
         .handler = install_guide_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t wifi_status = {
+        .uri = "/api/wifi",
+        .method = HTTP_GET,
+        .handler = wifi_status_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t wifi_scan = {
+        .uri = "/api/wifi/scan",
+        .method = HTTP_GET,
+        .handler = wifi_scan_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t wifi_save = {
+        .uri = "/api/wifi/save",
+        .method = HTTP_GET,
+        .handler = wifi_save_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t wifi_forget = {
+        .uri = "/api/wifi/forget",
+        .method = HTTP_GET,
+        .handler = wifi_forget_handler,
+        .user_ctx = NULL,
+    };
     httpd_uri_t params = {
         .uri = "/api/params",
         .method = HTTP_GET,
@@ -2468,7 +2719,7 @@ static esp_err_t start_http_server(void)
         .user_ctx = NULL,
     };
     config.stack_size = 10240;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 24;
 
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
@@ -2480,6 +2731,10 @@ static esp_err_t start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &install_mode_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &install_mode_set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &install_guide));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_status));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_save));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_forget));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &params));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &snap));
@@ -2503,26 +2758,40 @@ static void wifi_event_handler(void *arg,
     (void)arg;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "WiFi STA start, connecting to SSID \"%s\"", WIFI_STA_SSID);
-        esp_wifi_connect();
+        if (g_wifi_sta_configured && g_wifi_sta_ssid[0] != '\0') {
+            ESP_LOGI(TAG, "WiFi STA start, connecting to SSID \"%s\"", g_wifi_sta_ssid);
+            esp_wifi_connect();
+        } else {
+            ESP_LOGI(TAG, "WiFi STA start, waiting for WiFi setup");
+        }
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
+        ESP_LOGI(TAG, "WiFi AP ready: SSID \"%s\"", WIFI_AP_SSID);
         return;
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        g_wifi_sta_connected = 0;
+        g_wifi_sta_ip[0] = '\0';
         ESP_LOGW(TAG, "WiFi disconnected, retrying");
-        esp_wifi_connect();
+        if (g_wifi_sta_configured && g_wifi_sta_ssid[0] != '\0') {
+            esp_wifi_connect();
+        }
         return;
     }
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        g_wifi_sta_connected = 1;
+        snprintf(g_wifi_sta_ip, sizeof(g_wifi_sta_ip), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
 
-static esp_err_t init_wifi_sta(void)
+static esp_err_t wifi_apply_sta_config(void)
 {
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     wifi_config_t wifi_cfg = {
         .sta = {
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
@@ -2532,18 +2801,46 @@ static esp_err_t init_wifi_sta(void)
             },
         },
     };
+    size_t ssid_len = strnlen(g_wifi_sta_ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    size_t pass_len = strnlen(g_wifi_sta_pass, sizeof(wifi_cfg.sta.password) - 1);
 
-    snprintf((char *)wifi_cfg.sta.ssid, sizeof(wifi_cfg.sta.ssid), "%s", WIFI_STA_SSID);
-    snprintf((char *)wifi_cfg.sta.password, sizeof(wifi_cfg.sta.password), "%s", WIFI_STA_PASS);
+    memcpy(wifi_cfg.sta.ssid, g_wifi_sta_ssid, ssid_len);
+    wifi_cfg.sta.ssid[ssid_len] = '\0';
+    memcpy(wifi_cfg.sta.password, g_wifi_sta_pass, pass_len);
+    wifi_cfg.sta.password[pass_len] = '\0';
+    return esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+}
+
+static esp_err_t init_wifi_network(void)
+{
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid_len = 0,
+            .channel = 1,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+
+    memcpy(ap_cfg.ap.ssid, WIFI_AP_SSID, strlen(WIFI_AP_SSID));
+    memcpy(ap_cfg.ap.password, WIFI_AP_PASS, strlen(WIFI_AP_PASS));
+    ap_cfg.ap.ssid_len = strlen(WIFI_AP_SSID);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(wifi_apply_sta_config());
     ESP_ERROR_CHECK(esp_wifi_start());
     return ESP_OK;
 }
@@ -2559,6 +2856,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     load_install_config();
+    load_wifi_config();
 
     g_bridge_lock = xSemaphoreCreateMutex();
     assert(g_bridge_lock != NULL);
@@ -2568,7 +2866,7 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "preview cache allocated: %u bytes", (unsigned)g_latest_jpeg_capacity);
 
-    init_wifi_sta();
+    init_wifi_network();
     init_t23_uart();
     init_spi_slave();
     init_led_power_enable();
