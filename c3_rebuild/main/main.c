@@ -566,7 +566,6 @@ static const char g_index_html[] =
     "          </select>\n"
     "          <button id=\"showInstallGuideBtn\">Enable Install Guide</button>\n"
     "        </div>\n"
-    "        <p class=\"subtitle\">Install mode changes the physical LED direction mapping. The preview below stays in logical TV coordinates, while the strip output follows the selected install mode. Unlock the install guide only when you need to change wiring orientation.</p>\n"
     "        <div class=\"button-row\">\n"
     "          <button id=\"snapBtn\">Capture Snapshot</button>\n"
     "          <button id=\"autoPreviewBtn\">Start Auto Preview</button>\n"
