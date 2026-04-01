@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 #include "sm16703sp3.h"
@@ -129,6 +130,7 @@ static size_t g_latest_jpeg_capacity;
 static char g_latest_border_json[4096];
 static int g_latest_border_json_valid;
 static volatile c3_mode_t g_c3_mode = C3_MODE_DEBUG;
+static int g_install_setup_active = 1;
 static const border_layout_desc_t g_layout_16x9 = { "16X9", 16, 9, 16, 9 };
 static const border_layout_desc_t g_layout_4x3 = { "4X3", 4, 3, 4, 3 };
 static const border_layout_desc_t *g_current_layout = &g_layout_16x9;
@@ -173,6 +175,83 @@ static const led_install_desc_t *find_install_mode_desc(const char *name)
         return &g_install_right_bottom;
     }
     return &g_install_left_top;
+}
+
+static uint8_t install_mode_to_u8(const led_install_desc_t *desc)
+{
+    if (desc == &g_install_left_bottom) {
+        return (uint8_t)LED_INSTALL_LEFT_BOTTOM;
+    }
+    if (desc == &g_install_right_top) {
+        return (uint8_t)LED_INSTALL_RIGHT_TOP;
+    }
+    if (desc == &g_install_right_bottom) {
+        return (uint8_t)LED_INSTALL_RIGHT_BOTTOM;
+    }
+    return (uint8_t)LED_INSTALL_LEFT_TOP;
+}
+
+static const led_install_desc_t *install_mode_from_u8(uint8_t value)
+{
+    switch (value) {
+    case LED_INSTALL_LEFT_BOTTOM:
+        return &g_install_left_bottom;
+    case LED_INSTALL_RIGHT_TOP:
+        return &g_install_right_top;
+    case LED_INSTALL_RIGHT_BOTTOM:
+        return &g_install_right_bottom;
+    case LED_INSTALL_LEFT_TOP:
+    default:
+        return &g_install_left_top;
+    }
+}
+
+static void load_install_config(void)
+{
+    nvs_handle_t nvs = 0;
+    uint8_t mode_value = (uint8_t)LED_INSTALL_LEFT_TOP;
+    uint8_t active = 1;
+
+    if (nvs_open("c3cfg", NVS_READONLY, &nvs) != ESP_OK) {
+        g_install_mode = &g_install_left_top;
+        g_install_setup_active = 1;
+        return;
+    }
+
+    if (nvs_get_u8(nvs, "install_mode", &mode_value) == ESP_OK) {
+        g_install_mode = install_mode_from_u8(mode_value);
+    } else {
+        g_install_mode = &g_install_left_top;
+    }
+
+    if (nvs_get_u8(nvs, "install_active", &active) == ESP_OK) {
+        g_install_setup_active = active ? 1 : 0;
+    } else {
+        g_install_setup_active = 1;
+    }
+
+    nvs_close(nvs);
+}
+
+static esp_err_t save_install_config(void)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t ret = nvs_open("c3cfg", NVS_READWRITE, &nvs);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_u8(nvs, "install_mode", install_mode_to_u8(g_install_mode));
+    if (ret == ESP_OK) {
+        ret = nvs_set_u8(nvs, "install_active", g_install_setup_active ? 1 : 0);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+
+    nvs_close(nvs);
+    return ret;
 }
 
 static const border_layout_desc_t *find_layout_desc(const char *name)
@@ -485,9 +564,9 @@ static const char g_index_html[] =
     "            <option value=\"RIGHT_TOP\">Right short -> Top long</option>\n"
     "            <option value=\"RIGHT_BOTTOM\">Right short -> Bottom long</option>\n"
     "          </select>\n"
-    "          <button id=\"showInstallGuideBtn\">Replay Install Guide</button>\n"
+    "          <button id=\"showInstallGuideBtn\">Enable Install Guide</button>\n"
     "        </div>\n"
-    "        <p class=\"subtitle\">Install mode changes the physical LED direction mapping. The preview below stays in logical TV coordinates, while the strip output follows the selected install mode.</p>\n"
+    "        <p class=\"subtitle\">Install mode changes the physical LED direction mapping. The preview below stays in logical TV coordinates, while the strip output follows the selected install mode. Unlock the install guide only when you need to change wiring orientation.</p>\n"
     "        <div class=\"button-row\">\n"
     "          <button id=\"snapBtn\">Capture Snapshot</button>\n"
     "          <button id=\"autoPreviewBtn\">Start Auto Preview</button>\n"
@@ -620,13 +699,13 @@ static const char g_app_js[] =
     "];\n"
     "const POINT_LABELS=['TL','TM','TR','RM','BR','BM','BL','LM'];\n"
     "const ui={snapBtn:document.getElementById('snapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),layoutSelect:document.getElementById('layoutSelect'),installModeSelect:document.getElementById('installModeSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),loadCalibrationBtn:document.getElementById('loadCalibrationBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
-    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',installMode:'LEFT_TOP',lastBlocksAt:0,defaultsLoaded:false,calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
+    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',installMode:'LEFT_TOP',installGuideActive:true,lastBlocksAt:0,defaultsLoaded:false,calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
     "function log(m){const ts=new Date().toLocaleTimeString();ui.logBox.textContent+=`[${ts}] ${m}\\n`;ui.logBox.scrollTop=ui.logBox.scrollHeight;}\n"
     "function setPreviewStatus(t,k='idle'){ui.previewStatus.textContent=t;ui.previewStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.previewStatus.classList.add('is-busy');else if(k==='good')ui.previewStatus.classList.add('is-good');else if(k==='bad')ui.previewStatus.classList.add('is-bad');}\n"
     "function setCalibrationStatus(t,k='idle'){ui.calibrationStatus.textContent=t;ui.calibrationStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.calibrationStatus.classList.add('is-busy');else if(k==='good')ui.calibrationStatus.classList.add('is-good');else if(k==='bad')ui.calibrationStatus.classList.add('is-bad');}\n"
     "function waitForImage(img){if(img.complete&&img.naturalWidth>0)return Promise.resolve();return new Promise((resolve,reject)=>{const onLoad=()=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);resolve();};const onError=(e)=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);reject(e);};img.addEventListener('load',onLoad,{once:true});img.addEventListener('error',onError,{once:true});});}\n"
     "function applyLayoutMeta(data){if(!data)return;const layout=data.layout||state.layout||'16X9';state.layout=layout;if(ui.layoutSelect&&ui.layoutSelect.value!==layout)ui.layoutSelect.value=layout;}\n"
-    "function applyInstallModeMeta(data){if(!data)return;const installMode=data.installMode||state.installMode||'LEFT_TOP';state.installMode=installMode;if(ui.installModeSelect&&ui.installModeSelect.value!==installMode)ui.installModeSelect.value=installMode;}\n"
+    "function applyInstallModeMeta(data){if(!data)return;const installMode=data.installMode||state.installMode||'LEFT_TOP';state.installMode=installMode;state.installGuideActive=typeof data.installGuideActive==='boolean'?data.installGuideActive:state.installGuideActive;if(ui.installModeSelect&&ui.installModeSelect.value!==installMode)ui.installModeSelect.value=installMode;if(ui.installModeSelect)ui.installModeSelect.disabled=!state.installGuideActive; if(ui.showInstallGuideBtn){ui.showInstallGuideBtn.textContent=state.installGuideActive?'Finish Install Guide':'Enable Install Guide'; ui.showInstallGuideBtn.classList.toggle('is-good',state.installGuideActive);} }\n"
     "function getLayoutMeta(d){const top=d.topBlocks||16,right=d.rightBlocks||9,bottom=d.bottomBlocks||16,left=d.leftBlocks||9;return{top,right,bottom,left,total:(d.blockCount||d.blocks?.length||0),layout:(d.layout||state.layout||'16X9')};}\n"
     "function setModeUi(mode){state.mode=mode;ui.modeBadge.textContent=`Mode: ${mode}`;const isRun=mode==='RUN';ui.originalPane.classList.toggle('is-hidden',isRun);ui.ispPanel.classList.toggle('is-hidden',isRun);ui.calibrationPanel.classList.toggle('is-hidden',isRun);ui.snapBtn.disabled=isRun;ui.autoPreviewBtn.disabled=isRun;ui.enterRunBtn.disabled=isRun;ui.returnDebugBtn.disabled=!isRun;if(isRun){setPreviewStatus('Run mode active: LED output only','good');}else{setPreviewStatus('Debug mode active','good');}}\n"
     "function renderParams(){ui.paramGrid.innerHTML='';for(const p of PARAMS){const card=document.createElement('article');card.className='param-card';card.innerHTML=`<header><label for=\"slider-${p.key}\">${p.label}</label><span class=\"value\" id=\"value-${p.key}\">-</span></header><input id=\"slider-${p.key}\" type=\"range\" min=\"${p.min}\" max=\"${p.max}\" step=\"${p.step}\" value=\"${p.min}\"><div class=\"param-actions\"><button id=\"default-${p.key}\">Restore Default</button></div>`;ui.paramGrid.appendChild(card);const slider=document.getElementById(`slider-${p.key}`);const value=document.getElementById(`value-${p.key}`);const defaultBtn=document.getElementById(`default-${p.key}`);defaultBtn.onclick=()=>restoreDefault(p);slider.oninput=()=>{value.textContent=slider.value;};slider.onchange=()=>setParam(p.key,slider.value,true);p.slider=slider;p.valueLabel=value;p.defaultBtn=defaultBtn;updateDefaultButtonState(p);}}\n"
@@ -653,7 +732,7 @@ static const char g_app_js[] =
     "async function refreshInstallMode(){log('GET /api/install_mode');try{const data=await fetchJson('/api/install_mode');applyInstallModeMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function setLayout(value){log(`GET /api/layout/set?value=${value}`);try{const data=await fetchJson(`/api/layout/set?value=${encodeURIComponent(value)}`);applyLayoutMeta(data);drawBorderBlocks();if(state.mode==='RUN')await refreshRuntimeBlocks();else await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setInstallMode(value){log(`GET /api/install_mode/set?value=${value}`);try{const data=await fetchJson(`/api/install_mode/set?value=${encodeURIComponent(value)}`);applyInstallModeMeta(data);setPreviewStatus(`Install mapping updated: ${data.label}`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
-    "async function showInstallGuide(){log('GET /api/install_guide');try{await fetchJson('/api/install_guide');setPreviewStatus('Install guide replayed: blue short edge + red long edge','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function toggleInstallGuide(){const active=state.installGuideActive?0:1;log(`GET /api/install_guide?active=${active}`);try{const data=await fetchJson(`/api/install_guide?active=${active}`);applyInstallModeMeta(data);setPreviewStatus(state.installGuideActive?'Install guide active: choose direction now':'Install guide locked: saved for next boot','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshMode(){log('GET /api/mode');try{const data=await fetchJson('/api/mode');setModeUi(data.mode||'DEBUG');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setMode(mode){log(`GET /api/mode/set?value=${mode}`);try{const data=await fetchJson(`/api/mode/set?value=${encodeURIComponent(mode)}`);setModeUi(data.mode||mode);if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';}}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshValues(){setPreviewStatus('Refreshing parameters...','busy');log('GET /api/params');try{const data=await fetchJson('/api/params');applyValues(data);setPreviewStatus('Parameters refreshed','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
@@ -664,7 +743,7 @@ static const char g_app_js[] =
     "async function captureSnapshot(){if(state.previewBusy)return false;state.previewBusy=true;setPreviewStatus('Capturing snapshot...','busy');const url=`/api/snap?t=${Date.now()}`;log(`GET ${url}`);try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();if(state.previewUrl)URL.revokeObjectURL(state.previewUrl);state.previewUrl=URL.createObjectURL(blob);ui.previewImage.src=state.previewUrl;await waitForImage(ui.previewImage);setPreviewStatus('Preview updated','good');return true;}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');return false;}finally{state.previewBusy=false;}}\n"
     "async function refreshPreviewAndBlocks(){const ok=await captureSnapshot();if(ok)await refreshBorderBlocks();}\n"
     "function startAutoPreview(){if(state.mode==='RUN'){setPreviewStatus('Run mode disables web preview for lowest latency','good');return;}if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';setPreviewStatus('Auto preview stopped');return;}const runner=refreshPreviewAndBlocks;runner();state.autoPreviewTimer=setInterval(()=>runner(),280);ui.autoPreviewBtn.textContent='Stop Auto Preview';setPreviewStatus('Auto preview running','good');}\n"
-    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.showInstallGuideBtn.onclick=showInstallGuide;ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.loadCalibrationBtn.onclick=loadCalibration;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});\n";
+    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.loadCalibrationBtn.onclick=loadCalibration;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});\n";
 
 static void post_setup_cb(spi_slave_transaction_t *trans)
 {
@@ -2020,13 +2099,14 @@ static esp_err_t layout_set_handler(httpd_req_t *req)
 
 static esp_err_t install_mode_get_handler(httpd_req_t *req)
 {
-    char json[160];
+    char json[192];
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\"}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
-             g_install_mode->label);
+             g_install_mode->label,
+             g_install_setup_active ? "true" : "false");
     return send_json(req, json);
 }
 
@@ -2034,7 +2114,7 @@ static esp_err_t install_mode_set_handler(httpd_req_t *req)
 {
     char query[96];
     char value[32];
-    char json[160];
+    char json[192];
     const led_install_desc_t *desc;
     esp_err_t ret;
 
@@ -2049,8 +2129,15 @@ static esp_err_t install_mode_set_handler(httpd_req_t *req)
     if (strcmp(desc->name, value) != 0) {
         return send_error_json(req, "unknown install mode", HTTPD_400_BAD_REQUEST);
     }
+    if (!g_install_setup_active) {
+        return send_error_json(req, "install guide locked", HTTPD_400_BAD_REQUEST);
+    }
 
     g_install_mode = desc;
+    ret = save_install_config();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "install mode save failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
     ret = show_install_guide_pattern();
     if (ret != ESP_OK) {
         return send_error_json(req, "install guide failed", HTTPD_500_INTERNAL_SERVER_ERROR);
@@ -2058,26 +2145,50 @@ static esp_err_t install_mode_set_handler(httpd_req_t *req)
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\"}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
-             g_install_mode->label);
+             g_install_mode->label,
+             g_install_setup_active ? "true" : "false");
     return send_json(req, json);
 }
 
 static esp_err_t install_guide_handler(httpd_req_t *req)
 {
-    char json[160];
-    esp_err_t ret = show_install_guide_pattern();
+    char query[96];
+    char value[8];
+    char json[192];
+    esp_err_t ret;
 
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "active", value, sizeof(value)) == ESP_OK) {
+        g_install_setup_active = (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0) ? 1 : 0;
+    } else {
+        g_install_setup_active = g_install_setup_active ? 0 : 1;
+    }
+
+    ret = save_install_config();
     if (ret != ESP_OK) {
-        return send_error_json(req, "install guide failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+        return send_error_json(req, "install guide save failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    if (g_install_setup_active) {
+        ret = show_install_guide_pattern();
+        if (ret != ESP_OK) {
+            return send_error_json(req, "install guide failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+        }
+    } else {
+        ret = sm16703sp3_clear();
+        if (ret != ESP_OK) {
+            return send_error_json(req, "install guide clear failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+        }
     }
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\"}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
-             g_install_mode->label);
+             g_install_mode->label,
+             g_install_setup_active ? "true" : "false");
     return send_json(req, json);
 }
 
@@ -2448,6 +2559,7 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    load_install_config();
 
     g_bridge_lock = xSemaphoreCreateMutex();
     assert(g_bridge_lock != NULL);
@@ -2466,7 +2578,15 @@ void app_main(void)
         .gpio_num = LED_STRIP_GPIO,
         .led_count = LED_STRIP_COUNT,
     }));
-    ESP_ERROR_CHECK(show_install_guide_pattern());
+    ESP_LOGI(TAG,
+             "Install config loaded: mode=%s active=%d",
+             g_install_mode->name,
+             g_install_setup_active);
+    if (g_install_setup_active) {
+        ESP_ERROR_CHECK(show_install_guide_pattern());
+    } else {
+        ESP_ERROR_CHECK(sm16703sp3_clear());
+    }
     if (bridge_get_mode(&initial_mode) == ESP_OK) {
         g_c3_mode = initial_mode;
         ESP_LOGI(TAG, "Initial T23 mode: %s", c3_mode_name(g_c3_mode));
