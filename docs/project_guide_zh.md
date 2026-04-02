@@ -135,8 +135,8 @@ T23 的应用模式由：
 | `GET ALL` | C3 -> T23 | 读取全部 ISP 参数 |
 | `SET <KEY> <VALUE>` | C3 -> T23 | 修改单个 ISP 参数 |
 | `SNAP` | C3 -> T23 | 请求一张普通 JPEG，图像随后走 SPI |
-| `CAL GET` | C3 -> T23 | 读取保存的 8 点校准数据 |
-| `CAL SET ...` | C3 -> T23 | 写入 8 点校准数据 |
+| `CAL GET` | C3 -> T23 | 读取保存的 10 点校准数据 |
+| `CAL SET ...` | C3 -> T23 | 写入 10 点校准数据 |
 | `CAL SNAP` | C3 -> T23 | 请求一张 T23 内部校正后的 JPEG，图像随后走 SPI |
 | `BLOCKS GET` | C3 -> T23 | 在 `DEBUG` 下请求一次边框色块结果 |
 | `FRAME` | C3 -> T23 | 在 `DEBUG` 下请求“同一帧原图 + 色块” |
@@ -248,15 +248,21 @@ http://<C3-IP>/
 | `SHARPNESS` | 锐度 |
 | `SATURATION` | 饱和度 |
 | `AE_COMP` | 自动曝光补偿 |
-| `DPC` | 坏点校正强度 |
 | `DRC` | 动态范围压缩强度 |
 | `AWB_CT` | 白平衡色温 |
+| `HUE` | 色调 |
 
 说明：
 
 - 参数控制链路已经稳定可用
 - 自动预览仍然存在一定卡顿
 - 这是当前整图 JPEG 方案的自然限制
+- `Save Startup Params` 会把当前 8 个 ISP 参数保存到 C3 的 `NVS`
+  - 下次上电时，C3 会自动把这组已保存参数重新下发给 T23
+  - 如果本次只是临时调参、没有点击保存，重启后仍回到 T23 默认参数
+- `Capture Snapshot` 不是电脑截图，而是立即向 T23 请求一张新的预览帧
+  - 它会同时刷新左侧原图预览和右侧边框色块预览
+  - 如果已经开启 `Auto Preview`，手动点一次通常不会有很明显的额外变化
 - `LED Install` 只影响物理灯带方向映射，不改变逻辑边框预览图
 - `LED RGB Order` 用于适配不同灯带芯片或成品控制板的颜色通道顺序，当前支持：
   - `RGB`
@@ -276,8 +282,11 @@ http://<C3-IP>/
   - 两个面板宽度对半，避免控件集中在右上角而发生重叠
 - `Border Calibration` 当前已经支持：
   - 左侧显示真实校准抓拍图
-  - 拖动 8 个点并保存到 T23
-  - 右侧显示由 T23 内部完成 8 点拉正后回传的真实校正预览图
+  - 拖动 10 个点并保存到 T23
+  - 点位顺序是 `TL / TML / TM / TMR / TR / RM / BR / BM / BL / LM`
+  - 上边额外增加了 `TML` 和 `TMR` 两个控制点，专门用于拟合鱼眼镜头下最长、弧度最大的上边框
+  - 页面里已经移除 `Load Saved Points` 按钮；已保存校准会在页面初始化时自动读取
+  - 右侧显示由 T23 内部完成 10 点拉正后回传的真实校正预览图
 
 ## 11. 当前校正算法说明
 
@@ -295,12 +304,14 @@ http://<C3-IP>/
 当前算法输入有两部分：
 
 1. 一张当前抓拍得到的原始 JPEG
-2. 网页上拖动得到的 8 个标定点
+2. 网页上拖动得到的 10 个标定点
 
-这 8 个点按顺时针和边中点顺序保存：
+这 10 个点按顺时针和边中点顺序保存：
 
 - `TL` 左上角
+- `TML` 上边左中点
 - `TM` 上边中点
+- `TMR` 上边右中点
 - `TR` 右上角
 - `RM` 右边中点
 - `BR` 右下角
@@ -317,13 +328,13 @@ http://<C3-IP>/
 当前校正流程是：
 
 1. 网页调用 `/api/calibration/set`
-2. `C3` 通过 `UART` 把 8 点标定数据发给 `T23`
-3. `T23` 保存这 8 个点
+2. `C3` 通过 `UART` 把 10 点标定数据发给 `T23`
+3. `T23` 保存这 10 个点
 4. 网页再调用 `/api/calibration/rectified`
 5. `C3` 通过 `UART` 发 `CAL SNAP`
 6. `T23` 抓一张当前 JPEG
 7. `T23` 在内部解 JPEG 成 `RGB888`
-8. `T23` 根据 8 个点做边框拉正
+8. `T23` 根据 10 个点做边框拉正
 9. `T23` 把拉正后的结果重新编码成 JPEG
 10. `T23` 通过 `SPI` 把这张校正后的 JPEG 发给 `C3`
 11. `C3` 再通过 HTTP 把图发给浏览器
@@ -335,14 +346,14 @@ http://<C3-IP>/
 
 ### 11.3 当前几何映射怎么做
 
-当前不是简单四点透视，而是“8 点边界曲线 + 曲面插值”的做法。
+当前不是简单四点透视，而是“10 点边界曲线 + 曲面插值”的做法。
 
 具体步骤：
 
-1. 先把 8 个点缩放到当前抓拍 JPEG 的真实像素坐标
+1. 先把 10 个点缩放到当前抓拍 JPEG 的真实像素坐标
    - 函数：`scaled_calibration_points()`
 
-2. 用上边、下边、左边、右边各 3 个点，分别构造 4 条二次 Bezier 边界曲线
+2. 用上边 5 个点、下边 3 个点、左边 3 个点、右边 3 个点，共同构造四条边界曲线
    - 函数：`pointf_bezier2()`
 
 3. 再用这 4 条边界曲线构造一个 Coons Patch 曲面
@@ -356,7 +367,8 @@ http://<C3-IP>/
 这样做的好处是：
 
 - 比单纯 4 角透视更适合“边有弯曲”的情况
-- 4 个边中点可以参与修正边缘弯曲
+- 顶边使用 5 个控制点后，更适合拟合鱼眼镜头下明显上拱的电视上边框
+- 右、下、左三边仍保留较少控制点，能在拟合能力和交互复杂度之间保持平衡
 
 ### 11.4 为什么现在输出图是 16:9
 
@@ -364,7 +376,7 @@ http://<C3-IP>/
 
 当前版本会：
 
-1. 根据 8 个点估计电视边框的平均宽和高
+1. 根据 10 个点估计电视边框的平均宽和高
 2. 把输出画布归一化到标准 `16:9`
 3. 在这个规则矩形上完成拉正映射
 
@@ -388,7 +400,7 @@ http://<C3-IP>/
 
 当前这版的定位是：
 
-- 先把“8 点标定 -> T23 内部校正 -> 网页看到校正结果”这条链打通
+- 先把“10 点标定 -> T23 内部校正 -> 网页看到校正结果”这条链打通
 
 ### 11.6 这个算法为什么适合后续 50 区域
 
@@ -542,14 +554,16 @@ http://<C3-IP>/
 | 14 | `root_handler / app_js_handler / styles_handler` | 返回网页 HTML/JS/CSS |
 | 15 | `mode_get_handler / mode_set_handler` | 查询或切换 `DEBUG / RUN` |
 | 16 | `layout_get_handler / layout_set_handler` | 查询或切换 `16X9 / 4X3` |
-| 17 | `params_handler / set_handler` | 读取和设置 ISP 参数 |
-| 18 | `snap_handler` | 走 DEBUG 链抓普通 JPEG |
-| 19 | `calibration_get_handler / calibration_set_handler / calibration_rectified_handler` | 校准相关接口 |
-| 20 | `border_blocks_handler` | 在 DEBUG 下返回一次色块 JSON |
-| 21 | `runtime_blocks_handler` | 在 RUN 下返回轻量状态/缓存结果，网页不再依赖它驱动灯带 |
-| 22 | `bridge_fetch_frame_locked` | DEBUG 同帧抓图和色块同步链路 |
-| 23 | `bridge_fetch_snapshot_locked_ex` | 按命令类型请求 JPEG 并通过 SPI 收图 |
-| 24 | `uart_send_line / uart_read_line` | DEBUG 文本协议的 UART 发送与接收 |
+| 17 | `params_handler / set_handler / params_save_handler` | 读取、设置并保存 ISP 参数 |
+| 18 | `load_saved_isp_params / save_saved_isp_params` | 从 NVS 读取或写入启动参数 |
+| 19 | `boot_isp_sync_task` | 上电后把已保存 ISP 参数自动回放到 T23 |
+| 20 | `snap_handler` | 走 DEBUG 链抓普通 JPEG |
+| 21 | `calibration_get_handler / calibration_set_handler / calibration_rectified_handler` | 校准相关接口 |
+| 22 | `border_blocks_handler` | 在 DEBUG 下返回一次色块 JSON |
+| 23 | `runtime_blocks_handler` | 在 RUN 下返回轻量状态/缓存结果，网页不再依赖它驱动灯带 |
+| 24 | `bridge_fetch_frame_locked` | DEBUG 同帧抓图和色块同步链路 |
+| 25 | `bridge_fetch_snapshot_locked_ex` | 按命令类型请求 JPEG 并通过 SPI 收图 |
+| 26 | `uart_send_line / uart_read_line` | DEBUG 文本协议的 UART 发送与接收 |
 
 ## 13. 关键函数索引
 
@@ -578,6 +592,8 @@ http://<C3-IP>/
 | `update_led_strip_from_cache` | 将逻辑布局扩展成 50 颗物理灯珠 |
 | `bridge_fetch_frame_locked` | DEBUG 下抓同一帧原图和色块 |
 | `snap_handler` | 普通预览抓图接口 |
+| `params_save_handler` | 把当前 8 个 ISP 参数保存为启动参数 |
+| `boot_isp_sync_task` | 上电自动把已保存参数重新写入 T23 |
 | `mode_set_handler` | `DEBUG / RUN` 切换入口 |
 | `layout_set_handler` | `16X9 / 4X3` 布局切换入口 |
 
@@ -621,8 +637,8 @@ http://<C3-IP>/
 
 1. 保留当前整图预览，用于 ISP 调参
 2. 增加一次性的校准抓拍
-3. 网页上手动选择 8 个边框点
-4. 保存 8 点标定结果
+3. 网页上手动选择 10 个边框点
+4. 保存 10 点标定结果
 5. 在 T23 内部完成边框拉正 / 畸变补偿
 6. 提取电视边框 ROI
 7. 按固定顺序输出 50 个色块
@@ -685,7 +701,7 @@ http://<C3-IP>/
 
 当前 `RUN` 模式下的色块算法已经不再是“每帧先生成整张校正图，再从校正图切块”，而是：
 
-1. `DEBUG` 模式完成一次 8 点校准
+1. `DEBUG` 模式完成一次 10 点校准
 2. `RUN` 模式每帧直接抓当前图像
 3. 对每个目标色块区域，在逻辑上的校正矩形坐标里取样
 4. 通过反映射（`Coons Patch`）把这些采样点映射回原始图像

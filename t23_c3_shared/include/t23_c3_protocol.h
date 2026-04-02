@@ -53,6 +53,11 @@ typedef enum {
     T23_C3_PARAM_DPC = 6,
     T23_C3_PARAM_DRC = 7,
     T23_C3_PARAM_AWB_CT = 8,
+    T23_C3_PARAM_HUE = 9,
+    T23_C3_PARAM_HILIGHT = 10,
+    T23_C3_PARAM_BACKLIGHT = 11,
+    T23_C3_PARAM_TEMPER = 12,
+    T23_C3_PARAM_SINTER = 13,
 } t23_c3_param_id_t;
 
 typedef enum {

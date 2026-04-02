@@ -83,6 +83,8 @@ static t23_border_calibration_t g_calibration;
 static bridge_mode_t g_bridge_mode = BRIDGE_MODE_DEBUG;
 static t23_border_layout_t g_border_layout = T23_BORDER_LAYOUT_16X9;
 static uint16_t g_run_frame_seq = 1;
+static int g_temper_value_shadow = 128;
+static int g_sinter_value_shadow = 128;
 
 static void send_line(int fd, const char *line);
 static void sendf(int fd, const char *fmt, ...);
@@ -192,7 +194,9 @@ static void init_default_calibration(void)
     int right = w - left;
     int top = h / 8;
     int bottom = h - top;
+    int top_left_mid = left + (right - left) / 4;
     int cx = w / 2;
+    int top_right_mid = right - (right - left) / 4;
     int cy = h / 2;
 
     memset(&g_calibration, 0, sizeof(g_calibration));
@@ -201,8 +205,12 @@ static void init_default_calibration(void)
 
     g_calibration.points[T23_BORDER_POINT_TL].x = (int16_t)left;
     g_calibration.points[T23_BORDER_POINT_TL].y = (int16_t)top;
+    g_calibration.points[T23_BORDER_POINT_TML].x = (int16_t)top_left_mid;
+    g_calibration.points[T23_BORDER_POINT_TML].y = (int16_t)top;
     g_calibration.points[T23_BORDER_POINT_TM].x = (int16_t)cx;
     g_calibration.points[T23_BORDER_POINT_TM].y = (int16_t)top;
+    g_calibration.points[T23_BORDER_POINT_TMR].x = (int16_t)top_right_mid;
+    g_calibration.points[T23_BORDER_POINT_TMR].y = (int16_t)top;
     g_calibration.points[T23_BORDER_POINT_TR].x = (int16_t)right;
     g_calibration.points[T23_BORDER_POINT_TR].y = (int16_t)top;
     g_calibration.points[T23_BORDER_POINT_RM].x = (int16_t)right;
@@ -257,6 +265,30 @@ static pointf_t pointf_bezier2(pointf_t p0, pointf_t p1, pointf_t p2, double t)
     return out;
 }
 
+static pointf_t pointf_bezier4(pointf_t p0, pointf_t p1, pointf_t p2, pointf_t p3, pointf_t p4, double t)
+{
+    double omt = 1.0 - t;
+    double omt2 = omt * omt;
+    double omt3 = omt2 * omt;
+    double omt4 = omt3 * omt;
+    double t2 = t * t;
+    double t3 = t2 * t;
+    double t4 = t3 * t;
+    pointf_t out;
+
+    out.x = omt4 * p0.x +
+            4.0 * omt3 * t * p1.x +
+            6.0 * omt2 * t2 * p2.x +
+            4.0 * omt * t3 * p3.x +
+            t4 * p4.x;
+    out.y = omt4 * p0.y +
+            4.0 * omt3 * t * p1.y +
+            6.0 * omt2 * t2 * p2.y +
+            4.0 * omt * t3 * p3.y +
+            t4 * p4.y;
+    return out;
+}
+
 static void scaled_calibration_points(const t23_border_calibration_t *cal,
                                       int src_w,
                                       int src_h,
@@ -274,8 +306,10 @@ static void scaled_calibration_points(const t23_border_calibration_t *cal,
 
 static void compute_rectified_size(const pointf_t pts[T23_BORDER_POINT_COUNT], int *out_w, int *out_h)
 {
-    double top_len = pointf_distance(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_TM]) +
-                     pointf_distance(pts[T23_BORDER_POINT_TM], pts[T23_BORDER_POINT_TR]);
+    double top_len = pointf_distance(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_TML]) +
+                     pointf_distance(pts[T23_BORDER_POINT_TML], pts[T23_BORDER_POINT_TM]) +
+                     pointf_distance(pts[T23_BORDER_POINT_TM], pts[T23_BORDER_POINT_TMR]) +
+                     pointf_distance(pts[T23_BORDER_POINT_TMR], pts[T23_BORDER_POINT_TR]);
     double bottom_len = pointf_distance(pts[T23_BORDER_POINT_BL], pts[T23_BORDER_POINT_BM]) +
                         pointf_distance(pts[T23_BORDER_POINT_BM], pts[T23_BORDER_POINT_BR]);
     double left_len = pointf_distance(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_LM]) +
@@ -346,7 +380,12 @@ static void compute_calibration_bbox(const pointf_t pts[T23_BORDER_POINT_COUNT],
 
 static pointf_t coons_patch_point(const pointf_t pts[T23_BORDER_POINT_COUNT], double u, double v)
 {
-    pointf_t top = pointf_bezier2(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_TM], pts[T23_BORDER_POINT_TR], u);
+    pointf_t top = pointf_bezier4(pts[T23_BORDER_POINT_TL],
+                                  pts[T23_BORDER_POINT_TML],
+                                  pts[T23_BORDER_POINT_TM],
+                                  pts[T23_BORDER_POINT_TMR],
+                                  pts[T23_BORDER_POINT_TR],
+                                  u);
     pointf_t bottom = pointf_bezier2(pts[T23_BORDER_POINT_BL], pts[T23_BORDER_POINT_BM], pts[T23_BORDER_POINT_BR], u);
     pointf_t left = pointf_bezier2(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_LM], pts[T23_BORDER_POINT_BL], v);
     pointf_t right = pointf_bezier2(pts[T23_BORDER_POINT_TR], pts[T23_BORDER_POINT_RM], pts[T23_BORDER_POINT_BR], v);
@@ -1616,15 +1655,84 @@ static int set_awb_ct_value(int value)
     return IMP_ISP_Tuning_SetAwbCt(&ct);
 }
 
+static int get_hue_value(int *value)
+{
+    unsigned char v = 0;
+    int ret = IMP_ISP_Tuning_GetBcshHue(&v);
+    *value = (int)v;
+    return ret;
+}
+
+static int set_hue_value(int value)
+{
+    return IMP_ISP_Tuning_SetBcshHue((unsigned char)value);
+}
+
+static int get_hilight_value(int *value)
+{
+    unsigned int v = 0;
+    int ret = IMP_ISP_Tuning_GetHiLightDepress(&v);
+    *value = (int)v;
+    return ret;
+}
+
+static int set_hilight_value(int value)
+{
+    return IMP_ISP_Tuning_SetHiLightDepress((unsigned int)value);
+}
+
+static int get_backlight_value(int *value)
+{
+    unsigned int v = 0;
+    int ret = IMP_ISP_Tuning_GetBacklightComp(&v);
+    *value = (int)v;
+    return ret;
+}
+
+static int set_backlight_value(int value)
+{
+    return IMP_ISP_Tuning_SetBacklightComp((unsigned int)value);
+}
+
+static int get_temper_value(int *value)
+{
+    *value = g_temper_value_shadow;
+    return 0;
+}
+
+static int set_temper_value(int value)
+{
+    int ret = IMP_ISP_Tuning_SetTemperStrength((unsigned int)value);
+    if (ret == 0) {
+        g_temper_value_shadow = value;
+    }
+    return ret;
+}
+
+static int get_sinter_value(int *value)
+{
+    *value = g_sinter_value_shadow;
+    return 0;
+}
+
+static int set_sinter_value(int value)
+{
+    int ret = IMP_ISP_Tuning_SetSinterStrength((unsigned int)value);
+    if (ret == 0) {
+        g_sinter_value_shadow = value;
+    }
+    return ret;
+}
+
 static bridge_param_desc_t g_params[] = {
     { "BRIGHTNESS", T23_C3_PARAM_BRIGHTNESS, get_brightness_value, set_brightness_value, 0, 255 },
     { "CONTRAST", T23_C3_PARAM_CONTRAST, get_contrast_value, set_contrast_value, 0, 255 },
     { "SHARPNESS", T23_C3_PARAM_SHARPNESS, get_sharpness_value, set_sharpness_value, 0, 255 },
     { "SATURATION", T23_C3_PARAM_SATURATION, get_saturation_value, set_saturation_value, 0, 255 },
     { "AE_COMP", T23_C3_PARAM_AE_COMP, get_ae_comp_value, set_ae_comp_value, 90, 250 },
-    { "DPC", T23_C3_PARAM_DPC, get_dpc_value, set_dpc_value, 0, 255 },
     { "DRC", T23_C3_PARAM_DRC, get_drc_value, set_drc_value, 0, 255 },
     { "AWB_CT", T23_C3_PARAM_AWB_CT, get_awb_ct_value, set_awb_ct_value, 1500, 12000 },
+    { "HUE", T23_C3_PARAM_HUE, get_hue_value, set_hue_value, 0, 255 },
 };
 
 static bridge_param_desc_t *find_param(const char *name)
@@ -1667,45 +1775,44 @@ static void send_all_values(int fd)
 
 static void send_calibration(int fd)
 {
+    char line[256];
+    size_t len = 0;
+    unsigned int i;
+
     sendf(fd,
           "CAL SIZE %u %u",
           (unsigned int)g_calibration.image_width,
           (unsigned int)g_calibration.image_height);
-    sendf(fd,
-          "CAL POINTS %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
-          g_calibration.points[0].x,
-          g_calibration.points[0].y,
-          g_calibration.points[1].x,
-          g_calibration.points[1].y,
-          g_calibration.points[2].x,
-          g_calibration.points[2].y,
-          g_calibration.points[3].x,
-          g_calibration.points[3].y,
-          g_calibration.points[4].x,
-          g_calibration.points[4].y,
-          g_calibration.points[5].x,
-          g_calibration.points[5].y,
-          g_calibration.points[6].x,
-          g_calibration.points[6].y,
-          g_calibration.points[7].x,
-          g_calibration.points[7].y);
+    len = (size_t)snprintf(line, sizeof(line), "CAL POINTS");
+    for (i = 0; i < T23_BORDER_POINT_COUNT && len + 24 < sizeof(line); ++i) {
+        len += (size_t)snprintf(line + len,
+                                sizeof(line) - len,
+                                " %d %d",
+                                g_calibration.points[i].x,
+                                g_calibration.points[i].y);
+    }
+    send_line(fd, line);
     send_line(fd, "OK CAL GET");
 }
 
 static void handle_cal_set(int fd, char *args)
 {
     t23_border_calibration_t cal;
-    int values[18];
-    int parsed;
+    int values[2 + T23_BORDER_POINT_COUNT * 2];
+    char *token;
+    char *saveptr = NULL;
     int i;
 
     memset(&cal, 0, sizeof(cal));
-    parsed = sscanf(args,
-                    "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
-                    &values[0], &values[1], &values[2], &values[3], &values[4], &values[5],
-                    &values[6], &values[7], &values[8], &values[9], &values[10], &values[11],
-                    &values[12], &values[13], &values[14], &values[15], &values[16], &values[17]);
-    if (parsed != 18) {
+    for (i = 0; i < (int)(sizeof(values) / sizeof(values[0])); ++i) {
+        token = strtok_r((i == 0) ? args : NULL, " ", &saveptr);
+        if (token == NULL) {
+            send_line(fd, "ERR CAL_SET_FORMAT");
+            return;
+        }
+        values[i] = atoi(token);
+    }
+    if (strtok_r(NULL, " ", &saveptr) != NULL) {
         send_line(fd, "ERR CAL_SET_FORMAT");
         return;
     }
