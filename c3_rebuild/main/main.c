@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,7 @@
 #define JPEG_MIN_SIZE (32 * 1024)
 #define PREVIEW_REFRESH_MS 200
 #define ISP_SAVE_MAGIC 0x49535031u
+#define LED_CAL_MAGIC 0x4c454443u
 
 typedef struct {
     const char *name;
@@ -80,6 +82,11 @@ typedef enum {
     LED_INSTALL_RIGHT_BOTTOM = 3,
 } led_install_mode_t;
 
+typedef enum {
+    LED_STRIP_PROFILE_5M = 0,
+    LED_STRIP_PROFILE_38M = 1,
+} led_strip_profile_t;
+
 typedef struct {
     const char *name;
     const char *label;
@@ -105,6 +112,13 @@ typedef struct {
 } led_install_desc_t;
 
 typedef struct {
+    const char *name;
+    const char *label;
+    int segment_lengths[4];
+    int led_count;
+} led_strip_profile_desc_t;
+
+typedef struct {
     char layout_name[16];
     int block_count;
     int top_blocks;
@@ -127,6 +141,23 @@ typedef struct {
     uint32_t magic;
     int32_t values[13];
 } saved_isp_params_t;
+
+typedef enum {
+    LED_TEST_MODE_LIVE = 0,
+    LED_TEST_MODE_WHITE = 1,
+    LED_TEST_MODE_RED = 2,
+    LED_TEST_MODE_GREEN = 3,
+    LED_TEST_MODE_BLUE = 4,
+    LED_TEST_MODE_CYAN = 5,
+    LED_TEST_MODE_MAGENTA = 6,
+    LED_TEST_MODE_YELLOW = 7,
+} led_test_mode_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t gain[3];
+    uint16_t gamma[3];
+} led_color_calibration_t;
 
 static const bridge_param_t g_params[] = {
     { "BRIGHTNESS", T23_C3_PARAM_BRIGHTNESS },
@@ -156,6 +187,12 @@ static int g_wifi_sta_connected = 0;
 static const border_layout_desc_t g_layout_16x9 = { "16X9", 16, 9, 16, 9 };
 static const border_layout_desc_t g_layout_4x3 = { "4X3", 4, 3, 4, 3 };
 static const border_layout_desc_t *g_current_layout = &g_layout_16x9;
+static const led_strip_profile_desc_t g_strip_profile_5m = {
+    "5M", "5m (9 short / 16 long)", { 9, 16, 9, 16 }, 50
+};
+static const led_strip_profile_desc_t g_strip_profile_38m = {
+    "3P8M", "3.8m (7 short / 12 long)", { 7, 12, 7, 12 }, 38
+};
 static border_blocks_cache_t g_latest_blocks;
 static const led_install_desc_t g_install_left_top = {
     "LEFT_TOP", "Left short -> Top long",
@@ -181,15 +218,36 @@ static const led_color_order_desc_t g_color_order_gbr = { "GBR", "GBR", SM16703S
 static const led_color_order_desc_t g_color_order_brg = { "BRG", "BRG", SM16703SP3_ORDER_BRG };
 static const led_color_order_desc_t g_color_order_bgr = { "BGR", "BGR", SM16703SP3_ORDER_BGR };
 static const led_color_order_desc_t *g_led_color_order = &g_color_order_rgb;
+static const led_strip_profile_desc_t *g_led_strip_profile = &g_strip_profile_5m;
 static saved_isp_params_t g_saved_isp_params;
 static int g_saved_isp_params_valid = 0;
+static led_color_calibration_t g_led_cal = {
+    .magic = LED_CAL_MAGIC,
+    .gain = { 100, 100, 100 },
+    .gamma = { 100, 100, 100 },
+};
+static uint8_t g_led_color_lut[3][256];
+static led_test_mode_t g_led_test_mode = LED_TEST_MODE_LIVE;
 
 static esp_err_t spi_receive_frame(t23_c3_frame_t *frame, int timeout_ms);
 static esp_err_t wifi_apply_sta_config(void);
+static esp_err_t show_install_guide_pattern(void);
+static esp_err_t refresh_led_output_from_state(void);
 
 static const char *c3_mode_name(c3_mode_t mode)
 {
     return (mode == C3_MODE_RUN) ? "RUN" : "DEBUG";
+}
+
+static const led_strip_profile_desc_t *find_strip_profile_desc(const char *name)
+{
+    if (name == NULL) {
+        return &g_strip_profile_5m;
+    }
+    if (strcmp(name, g_strip_profile_38m.name) == 0) {
+        return &g_strip_profile_38m;
+    }
+    return &g_strip_profile_5m;
 }
 
 static const led_install_desc_t *find_install_mode_desc(const char *name)
@@ -207,6 +265,25 @@ static const led_install_desc_t *find_install_mode_desc(const char *name)
         return &g_install_right_bottom;
     }
     return &g_install_left_top;
+}
+
+static uint8_t strip_profile_to_u8(const led_strip_profile_desc_t *desc)
+{
+    if (desc == &g_strip_profile_38m) {
+        return (uint8_t)LED_STRIP_PROFILE_38M;
+    }
+    return (uint8_t)LED_STRIP_PROFILE_5M;
+}
+
+static const led_strip_profile_desc_t *strip_profile_from_u8(uint8_t value)
+{
+    switch (value) {
+    case LED_STRIP_PROFILE_38M:
+        return &g_strip_profile_38m;
+    case LED_STRIP_PROFILE_5M:
+    default:
+        return &g_strip_profile_5m;
+    }
 }
 
 static const led_color_order_desc_t *find_color_order_desc(const char *name)
@@ -266,6 +343,100 @@ static uint8_t color_order_to_u8(const led_color_order_desc_t *desc)
     return (uint8_t)(desc ? desc->order : SM16703SP3_ORDER_RGB);
 }
 
+static const char *led_test_mode_name(led_test_mode_t mode)
+{
+    switch (mode) {
+    case LED_TEST_MODE_WHITE:
+        return "WHITE";
+    case LED_TEST_MODE_RED:
+        return "RED";
+    case LED_TEST_MODE_GREEN:
+        return "GREEN";
+    case LED_TEST_MODE_BLUE:
+        return "BLUE";
+    case LED_TEST_MODE_CYAN:
+        return "CYAN";
+    case LED_TEST_MODE_MAGENTA:
+        return "MAGENTA";
+    case LED_TEST_MODE_YELLOW:
+        return "YELLOW";
+    case LED_TEST_MODE_LIVE:
+    default:
+        return "LIVE";
+    }
+}
+
+static led_test_mode_t led_test_mode_from_name(const char *name)
+{
+    if (name == NULL) {
+        return LED_TEST_MODE_LIVE;
+    }
+    if (strcmp(name, "WHITE") == 0) {
+        return LED_TEST_MODE_WHITE;
+    }
+    if (strcmp(name, "RED") == 0) {
+        return LED_TEST_MODE_RED;
+    }
+    if (strcmp(name, "GREEN") == 0) {
+        return LED_TEST_MODE_GREEN;
+    }
+    if (strcmp(name, "BLUE") == 0) {
+        return LED_TEST_MODE_BLUE;
+    }
+    if (strcmp(name, "CYAN") == 0) {
+        return LED_TEST_MODE_CYAN;
+    }
+    if (strcmp(name, "MAGENTA") == 0) {
+        return LED_TEST_MODE_MAGENTA;
+    }
+    if (strcmp(name, "YELLOW") == 0) {
+        return LED_TEST_MODE_YELLOW;
+    }
+    return LED_TEST_MODE_LIVE;
+}
+
+static uint8_t clamp_u8(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 255) {
+        return 255;
+    }
+    return (uint8_t)value;
+}
+
+/*
+ * Build a per-channel 8-bit LUT so runtime LED updates avoid powf() in the hot
+ * path. gain[] and gamma[] are stored as fixed-point percentages where 100
+ * means 1.00x.
+ */
+static void rebuild_led_color_lut(void)
+{
+    int ch;
+
+    for (ch = 0; ch < 3; ++ch) {
+        float gain = (float)g_led_cal.gain[ch] / 100.0f;
+        float gamma = (float)g_led_cal.gamma[ch] / 100.0f;
+        int value;
+
+        if (gain < 0.0f) {
+            gain = 0.0f;
+        }
+        if (gamma < 0.10f) {
+            gamma = 0.10f;
+        }
+
+        for (value = 0; value < 256; ++value) {
+            float normalized = (float)value / 255.0f;
+            float corrected = powf(normalized, gamma) * 255.0f * gain;
+            int out = (int)(corrected + 0.5f);
+
+            g_led_color_lut[ch][value] = clamp_u8(out);
+        }
+    }
+}
+
 static const led_color_order_desc_t *color_order_from_u8(uint8_t value)
 {
     switch ((sm16703sp3_color_order_t)value) {
@@ -291,6 +462,7 @@ static void load_install_config(void)
     uint8_t mode_value = (uint8_t)LED_INSTALL_LEFT_TOP;
     uint8_t active = 1;
     uint8_t color_order = (uint8_t)SM16703SP3_ORDER_RGB;
+    uint8_t strip_profile = (uint8_t)LED_STRIP_PROFILE_5M;
 
     if (nvs_open("c3cfg", NVS_READONLY, &nvs) != ESP_OK) {
         g_install_mode = &g_install_left_top;
@@ -316,7 +488,72 @@ static void load_install_config(void)
         g_led_color_order = &g_color_order_rgb;
     }
 
+    if (nvs_get_u8(nvs, "led_strip_pf", &strip_profile) == ESP_OK) {
+        g_led_strip_profile = strip_profile_from_u8(strip_profile);
+    } else {
+        g_led_strip_profile = &g_strip_profile_5m;
+    }
+
     nvs_close(nvs);
+}
+
+static void load_led_color_calibration(void)
+{
+    nvs_handle_t nvs = 0;
+    size_t len = sizeof(g_led_cal);
+    int ch;
+
+    g_led_cal.magic = LED_CAL_MAGIC;
+    g_led_cal.gain[0] = 100;
+    g_led_cal.gain[1] = 100;
+    g_led_cal.gain[2] = 100;
+    g_led_cal.gamma[0] = 100;
+    g_led_cal.gamma[1] = 100;
+    g_led_cal.gamma[2] = 100;
+
+    if (nvs_open("c3cfg", NVS_READONLY, &nvs) == ESP_OK) {
+        led_color_calibration_t temp;
+
+        memset(&temp, 0, sizeof(temp));
+        if (nvs_get_blob(nvs, "led_cal", &temp, &len) == ESP_OK &&
+            len == sizeof(temp) &&
+            temp.magic == LED_CAL_MAGIC) {
+            g_led_cal = temp;
+        }
+        nvs_close(nvs);
+    }
+
+    for (ch = 0; ch < 3; ++ch) {
+        if (g_led_cal.gain[ch] > 100) {
+            g_led_cal.gain[ch] = 100;
+        }
+        if (g_led_cal.gamma[ch] < 50) {
+            g_led_cal.gamma[ch] = 50;
+        } else if (g_led_cal.gamma[ch] > 300) {
+            g_led_cal.gamma[ch] = 300;
+        }
+    }
+
+    rebuild_led_color_lut();
+}
+
+static esp_err_t save_led_color_calibration(void)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t ret;
+
+    g_led_cal.magic = LED_CAL_MAGIC;
+    ret = nvs_open("c3cfg", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_blob(nvs, "led_cal", &g_led_cal, sizeof(g_led_cal));
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return ret;
 }
 
 static esp_err_t save_install_config(void)
@@ -334,6 +571,9 @@ static esp_err_t save_install_config(void)
     }
     if (ret == ESP_OK) {
         ret = nvs_set_u8(nvs, "led_rgb_order", color_order_to_u8(g_led_color_order));
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_u8(nvs, "led_strip_pf", strip_profile_to_u8(g_led_strip_profile));
     }
     if (ret == ESP_OK) {
         ret = nvs_commit(nvs);
@@ -647,6 +887,21 @@ static void get_edge_span(const border_blocks_cache_t *cache,
     }
 }
 
+static void apply_led_color_calibration(uint8_t *rgb, int count)
+{
+    int i;
+
+    if (rgb == NULL || count <= 0) {
+        return;
+    }
+
+    for (i = 0; i < count; ++i) {
+        rgb[i * 3 + 0] = g_led_color_lut[0][rgb[i * 3 + 0]];
+        rgb[i * 3 + 1] = g_led_color_lut[1][rgb[i * 3 + 1]];
+        rgb[i * 3 + 2] = g_led_color_lut[2][rgb[i * 3 + 2]];
+    }
+}
+
 /*
  * Expand the logical border layout into the fixed 50-pixel physical LED strip
  * order and push the result to the SM16703SP3 driver.
@@ -654,7 +909,6 @@ static void get_edge_span(const border_blocks_cache_t *cache,
 static esp_err_t update_led_strip_from_cache(const border_blocks_cache_t *cache)
 {
     uint8_t led_rgb[LED_STRIP_COUNT * 3];
-    static const int segment_lengths[4] = { 9, 16, 9, 16 };
     int dst_offset = 0;
     int seg;
 
@@ -666,34 +920,98 @@ static esp_err_t update_led_strip_from_cache(const border_blocks_cache_t *cache)
     for (seg = 0; seg < 4; ++seg) {
         int src_offset = 0;
         int src_count = 0;
+        int dst_count = g_led_strip_profile->segment_lengths[seg];
 
         get_edge_span(cache, g_install_mode->segments[seg].edge, &src_offset, &src_count);
         expand_block_segment(led_rgb,
                              dst_offset,
-                             segment_lengths[seg],
+                             dst_count,
                              cache,
                              src_offset,
                              src_count,
                              g_install_mode->segments[seg].reverse);
-        dst_offset += segment_lengths[seg];
+        dst_offset += dst_count;
     }
+    apply_led_color_calibration(led_rgb, LED_STRIP_COUNT);
     return sm16703sp3_show_rgb(led_rgb, LED_STRIP_COUNT);
+}
+
+static esp_err_t show_led_test_pattern(led_test_mode_t mode)
+{
+    uint8_t led_rgb[LED_STRIP_COUNT * 3];
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    int i;
+
+    switch (mode) {
+    case LED_TEST_MODE_WHITE:
+        r = 255;
+        g = 255;
+        b = 255;
+        break;
+    case LED_TEST_MODE_RED:
+        r = 255;
+        break;
+    case LED_TEST_MODE_GREEN:
+        g = 255;
+        break;
+    case LED_TEST_MODE_BLUE:
+        b = 255;
+        break;
+    case LED_TEST_MODE_CYAN:
+        g = 255;
+        b = 255;
+        break;
+    case LED_TEST_MODE_MAGENTA:
+        r = 255;
+        b = 255;
+        break;
+    case LED_TEST_MODE_YELLOW:
+        r = 255;
+        g = 255;
+        break;
+    case LED_TEST_MODE_LIVE:
+    default:
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    for (i = 0; i < LED_STRIP_COUNT; ++i) {
+        led_rgb[i * 3 + 0] = r;
+        led_rgb[i * 3 + 1] = g;
+        led_rgb[i * 3 + 2] = b;
+    }
+    apply_led_color_calibration(led_rgb, LED_STRIP_COUNT);
+    return sm16703sp3_show_rgb(led_rgb, LED_STRIP_COUNT);
+}
+
+static esp_err_t refresh_led_output_from_state(void)
+{
+    if (g_install_setup_active) {
+        return show_install_guide_pattern();
+    }
+    if (g_led_test_mode != LED_TEST_MODE_LIVE) {
+        return show_led_test_pattern(g_led_test_mode);
+    }
+    if (g_latest_blocks.ready) {
+        return update_led_strip_from_cache(&g_latest_blocks);
+    }
+    return sm16703sp3_clear();
 }
 
 static void refresh_led_strip_from_latest_blocks_if_allowed(void)
 {
-    if (g_c3_mode != C3_MODE_DEBUG || g_install_setup_active || !g_latest_blocks.ready) {
+    if (g_c3_mode != C3_MODE_DEBUG) {
         return;
     }
 
-    if (update_led_strip_from_cache(&g_latest_blocks) != ESP_OK) {
+    if (refresh_led_output_from_state() != ESP_OK) {
         ESP_LOGW(TAG, "DEBUG LED refresh skipped");
     }
 }
 
 static esp_err_t show_install_guide_pattern(void)
 {
-    static const int segment_lengths[4] = { 9, 16, 9, 16 };
     uint8_t led_rgb[LED_STRIP_COUNT * 3];
     int dst_offset = 0;
     int seg;
@@ -703,26 +1021,30 @@ static esp_err_t show_install_guide_pattern(void)
         uint8_t r = 0;
         uint8_t g = 0;
         uint8_t b = 0;
+        int segment_length = g_led_strip_profile->segment_lengths[seg];
         int i;
 
         /* Highlight only the selected installation start pair:
          * segment 0 = short edge (blue), segment 1 = following long edge (red).
          * Remaining segments stay off so customers can identify orientation quickly.
          */
-        if (seg == 0 && segment_lengths[seg] == 9) {
+        if (seg == 0) {
             b = 255;
-        } else if (seg == 1 && segment_lengths[seg] == 16) {
+        } else if (seg == 1) {
             r = 255;
         }
 
-        for (i = 0; i < segment_lengths[seg]; ++i) {
+        for (i = 0; i < segment_length; ++i) {
             led_rgb[(dst_offset + i) * 3 + 0] = r;
             led_rgb[(dst_offset + i) * 3 + 1] = g;
             led_rgb[(dst_offset + i) * 3 + 2] = b;
         }
-        dst_offset += segment_lengths[seg];
+        dst_offset += segment_length;
     }
-    ESP_LOGI(TAG, "LED install guide: selected short edge blue, selected long edge red (%s)", g_install_mode->name);
+    ESP_LOGI(TAG,
+             "LED install guide: selected short edge blue, selected long edge red (%s, %s)",
+             g_install_mode->name,
+             g_led_strip_profile->name);
     return sm16703sp3_show_rgb(led_rgb, LED_STRIP_COUNT);
 }
 
@@ -773,6 +1095,13 @@ static const char g_index_html[] =
     "          </select>\n"
     "          </div>\n"
     "          <div class=\"button-row\">\n"
+    "          <label for=\"stripProfileSelect\">LED Strip</label>\n"
+    "          <select id=\"stripProfileSelect\">\n"
+    "            <option value=\"5M\">5m</option>\n"
+    "            <option value=\"3P8M\">3.8m</option>\n"
+    "          </select>\n"
+    "          </div>\n"
+    "          <div class=\"button-row\">\n"
     "          <label for=\"installModeSelect\">LED Install</label>\n"
     "          <select id=\"installModeSelect\">\n"
     "            <option value=\"LEFT_TOP\">Left short -> Top long</option>\n"
@@ -805,6 +1134,22 @@ static const char g_index_html[] =
     "    <section class=\"panel\" id=\"ispPanel\">\n"
     "      <div class=\"section-header\"><h2>ISP Controls</h2><button id=\"saveParamsBtn\">Save Startup Params</button></div>\n"
     "      <div class=\"grid\" id=\"paramGrid\"></div>\n"
+    "    </section>\n"
+    "    <section class=\"panel\" id=\"ledCalPanel\">\n"
+    "      <div class=\"section-header\"><h2>LED Color Calibration</h2><span id=\"ledCalStatus\" class=\"preview-status\">Idle</span></div>\n"
+    "      <p class=\"subtitle\">Compensate strip color with per-channel gain and gamma. Live changes apply immediately to the real LEDs.</p>\n"
+    "      <div class=\"grid\" id=\"ledCalGrid\"></div>\n"
+    "      <div class=\"button-row calibration-actions\">\n"
+    "        <button id=\"ledCalSaveBtn\">Save LED Calibration</button>\n"
+    "        <button id=\"ledTestWhiteBtn\">White Test</button>\n"
+    "        <button id=\"ledTestRedBtn\">Red Test</button>\n"
+    "        <button id=\"ledTestGreenBtn\">Green Test</button>\n"
+    "        <button id=\"ledTestBlueBtn\">Blue Test</button>\n"
+    "        <button id=\"ledTestCyanBtn\">Cyan Test</button>\n"
+    "        <button id=\"ledTestMagentaBtn\">Magenta Test</button>\n"
+    "        <button id=\"ledTestYellowBtn\">Yellow Test</button>\n"
+    "        <button id=\"ledTestLiveBtn\">Return To Live</button>\n"
+    "      </div>\n"
     "    </section>\n"
     "    <section class=\"panel panel--preview\">\n"
     "      <div class=\"section-header\">\n"
@@ -928,15 +1273,24 @@ static const char g_app_js[] =
     " {key:'AWB_CT',label:'AWB Color Temp',min:1500,max:12000,step:10},\n"
     " {key:'HUE',label:'Hue',min:0,max:255,step:1}\n"
     "];\n"
+    "const LED_CAL_PARAMS=[\n"
+    " {key:'R_GAIN',json:'rGain',label:'Red Gain',min:0,max:100,step:1,suffix:'x',format:v=>(v/100).toFixed(2)+'x'},\n"
+    " {key:'G_GAIN',json:'gGain',label:'Green Gain',min:0,max:100,step:1,suffix:'x',format:v=>(v/100).toFixed(2)+'x'},\n"
+    " {key:'B_GAIN',json:'bGain',label:'Blue Gain',min:0,max:100,step:1,suffix:'x',format:v=>(v/100).toFixed(2)+'x'},\n"
+    " {key:'R_GAMMA',json:'rGamma',label:'Red Gamma',min:50,max:300,step:1,suffix:'',format:v=>(v/100).toFixed(2)},\n"
+    " {key:'G_GAMMA',json:'gGamma',label:'Green Gamma',min:50,max:300,step:1,suffix:'',format:v=>(v/100).toFixed(2)},\n"
+    " {key:'B_GAMMA',json:'bGamma',label:'Blue Gamma',min:50,max:300,step:1,suffix:'',format:v=>(v/100).toFixed(2)}\n"
+    "];\n"
     "const POINT_LABELS=['TL','TML','TM','TMR','TR','RM','BR','BM','BL','LM'];\n"
-    "const ui={snapBtn:document.getElementById('snapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),statusText:document.getElementById('statusText'),wifiStatusBadge:document.getElementById('wifiStatusBadge'),wifiHint:document.getElementById('wifiHint'),wifiScanSelect:document.getElementById('wifiScanSelect'),wifiScanBtn:document.getElementById('wifiScanBtn'),wifiSsidInput:document.getElementById('wifiSsidInput'),wifiPassInput:document.getElementById('wifiPassInput'),wifiSaveBtn:document.getElementById('wifiSaveBtn'),wifiForgetBtn:document.getElementById('wifiForgetBtn'),layoutSelect:document.getElementById('layoutSelect'),installModeSelect:document.getElementById('installModeSelect'),colorOrderSelect:document.getElementById('colorOrderSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),saveParamsBtn:document.getElementById('saveParamsBtn'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
-    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',installMode:'LEFT_TOP',colorOrder:'RGB',installGuideActive:true,wifiConfigured:true,wifiConnected:false,wifiSsid:'',wifiIp:'',lastBlocksAt:0,defaultsLoaded:false,calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
+    "const ui={snapBtn:document.getElementById('snapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),statusText:document.getElementById('statusText'),wifiStatusBadge:document.getElementById('wifiStatusBadge'),wifiHint:document.getElementById('wifiHint'),wifiScanSelect:document.getElementById('wifiScanSelect'),wifiScanBtn:document.getElementById('wifiScanBtn'),wifiSsidInput:document.getElementById('wifiSsidInput'),wifiPassInput:document.getElementById('wifiPassInput'),wifiSaveBtn:document.getElementById('wifiSaveBtn'),wifiForgetBtn:document.getElementById('wifiForgetBtn'),layoutSelect:document.getElementById('layoutSelect'),stripProfileSelect:document.getElementById('stripProfileSelect'),installModeSelect:document.getElementById('installModeSelect'),colorOrderSelect:document.getElementById('colorOrderSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),saveParamsBtn:document.getElementById('saveParamsBtn'),ledCalPanel:document.getElementById('ledCalPanel'),ledCalGrid:document.getElementById('ledCalGrid'),ledCalStatus:document.getElementById('ledCalStatus'),ledCalSaveBtn:document.getElementById('ledCalSaveBtn'),ledTestWhiteBtn:document.getElementById('ledTestWhiteBtn'),ledTestRedBtn:document.getElementById('ledTestRedBtn'),ledTestGreenBtn:document.getElementById('ledTestGreenBtn'),ledTestBlueBtn:document.getElementById('ledTestBlueBtn'),ledTestCyanBtn:document.getElementById('ledTestCyanBtn'),ledTestMagentaBtn:document.getElementById('ledTestMagentaBtn'),ledTestYellowBtn:document.getElementById('ledTestYellowBtn'),ledTestLiveBtn:document.getElementById('ledTestLiveBtn'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
+    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',stripProfile:'5M',installMode:'LEFT_TOP',colorOrder:'RGB',installGuideActive:true,wifiConfigured:true,wifiConnected:false,wifiSsid:'',wifiIp:'',lastBlocksAt:0,defaultsLoaded:false,ledCal:{rGain:100,gGain:100,bGain:100,rGamma:100,gGamma:100,bGamma:100,testMode:'LIVE'},calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
     "function log(m){const ts=new Date().toLocaleTimeString();ui.logBox.textContent+=`[${ts}] ${m}\\n`;ui.logBox.scrollTop=ui.logBox.scrollHeight;}\n"
     "function setPreviewStatus(t,k='idle'){ui.previewStatus.textContent=t;ui.previewStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.previewStatus.classList.add('is-busy');else if(k==='good')ui.previewStatus.classList.add('is-good');else if(k==='bad')ui.previewStatus.classList.add('is-bad');}\n"
     "function setCalibrationStatus(t,k='idle'){ui.calibrationStatus.textContent=t;ui.calibrationStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.calibrationStatus.classList.add('is-busy');else if(k==='good')ui.calibrationStatus.classList.add('is-good');else if(k==='bad')ui.calibrationStatus.classList.add('is-bad');}\n"
+    "function setLedCalStatus(t,k='idle'){ui.ledCalStatus.textContent=t;ui.ledCalStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.ledCalStatus.classList.add('is-busy');else if(k==='good')ui.ledCalStatus.classList.add('is-good');else if(k==='bad')ui.ledCalStatus.classList.add('is-bad');}\n"
     "function waitForImage(img){if(img.complete&&img.naturalWidth>0)return Promise.resolve();return new Promise((resolve,reject)=>{const onLoad=()=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);resolve();};const onError=(e)=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);reject(e);};img.addEventListener('load',onLoad,{once:true});img.addEventListener('error',onError,{once:true});});}\n"
     "function applyLayoutMeta(data){if(!data)return;const layout=data.layout||state.layout||'16X9';state.layout=layout;if(ui.layoutSelect&&ui.layoutSelect.value!==layout)ui.layoutSelect.value=layout;}\n"
-    "function applyInstallModeMeta(data){if(!data)return;const installMode=data.installMode||state.installMode||'LEFT_TOP';const colorOrder=data.colorOrder||state.colorOrder||'RGB';state.installMode=installMode;state.colorOrder=colorOrder;state.installGuideActive=typeof data.installGuideActive==='boolean'?data.installGuideActive:state.installGuideActive;if(ui.installModeSelect&&ui.installModeSelect.value!==installMode)ui.installModeSelect.value=installMode;if(ui.colorOrderSelect&&ui.colorOrderSelect.value!==colorOrder)ui.colorOrderSelect.value=colorOrder;if(ui.installModeSelect)ui.installModeSelect.disabled=!state.installGuideActive;if(ui.colorOrderSelect)ui.colorOrderSelect.disabled=!state.installGuideActive;if(ui.showInstallGuideBtn){ui.showInstallGuideBtn.textContent=state.installGuideActive?'Finish Install Guide':'Enable Install Guide';ui.showInstallGuideBtn.classList.toggle('is-good',state.installGuideActive);} }\n"
+    "function applyInstallModeMeta(data){if(!data)return;const installMode=data.installMode||state.installMode||'LEFT_TOP';const colorOrder=data.colorOrder||state.colorOrder||'RGB';const stripProfile=data.stripProfile||state.stripProfile||'5M';state.installMode=installMode;state.colorOrder=colorOrder;state.stripProfile=stripProfile;state.installGuideActive=typeof data.installGuideActive==='boolean'?data.installGuideActive:state.installGuideActive;if(ui.installModeSelect&&ui.installModeSelect.value!==installMode)ui.installModeSelect.value=installMode;if(ui.colorOrderSelect&&ui.colorOrderSelect.value!==colorOrder)ui.colorOrderSelect.value=colorOrder;if(ui.stripProfileSelect&&ui.stripProfileSelect.value!==stripProfile)ui.stripProfileSelect.value=stripProfile;if(ui.installModeSelect)ui.installModeSelect.disabled=!state.installGuideActive;if(ui.colorOrderSelect)ui.colorOrderSelect.disabled=!state.installGuideActive;if(ui.stripProfileSelect)ui.stripProfileSelect.disabled=!state.installGuideActive;if(ui.showInstallGuideBtn){ui.showInstallGuideBtn.textContent=state.installGuideActive?'Finish Install Guide':'Enable Install Guide';ui.showInstallGuideBtn.classList.toggle('is-good',state.installGuideActive);} }\n"
     "function applyWifiStatus(data){if(!data)return;state.wifiConfigured=!!data.configured;state.wifiConnected=!!data.connected;state.wifiSsid=data.ssid||'';state.wifiIp=data.ip||'';if(ui.wifiSsidInput&&!ui.wifiSsidInput.matches(':focus'))ui.wifiSsidInput.value=state.wifiSsid;if(ui.wifiStatusBadge){ui.wifiStatusBadge.textContent=state.wifiConnected?`WiFi: ${state.wifiSsid} (${state.wifiIp||'IP pending'})`:(state.wifiConfigured?`Connecting to ${state.wifiSsid||'saved WiFi'}`:'Setup mode');ui.wifiStatusBadge.classList.remove('is-good','is-busy','is-bad');ui.wifiStatusBadge.classList.add(state.wifiConnected?'is-good':'is-busy');}if(ui.statusText)ui.statusText.textContent=state.wifiConnected?`Connected to ${state.wifiSsid}`:`Connected to C3 bridge (${data.apSsid})`;if(ui.wifiHint)ui.wifiHint.textContent=`Fallback AP: ${data.apSsid} / ${data.apPass}`;}\n"
     "function applyWifiScan(data){if(!ui.wifiScanSelect)return;ui.wifiScanSelect.innerHTML='';const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent=data.results&&data.results.length?`Found ${data.results.length} network(s)`:'No networks found';ui.wifiScanSelect.appendChild(placeholder);for(const item of (data.results||[])){const opt=document.createElement('option');opt.value=item.ssid;opt.textContent=`${item.ssid} (${item.rssi} dBm)`;ui.wifiScanSelect.appendChild(opt);}ui.wifiScanSelect.value='';}\n"
     "function getLayoutMeta(d){const top=d.topBlocks||16,right=d.rightBlocks||9,bottom=d.bottomBlocks||16,left=d.leftBlocks||9;return{top,right,bottom,left,total:(d.blockCount||d.blocks?.length||0),layout:(d.layout||state.layout||'16X9')};}\n"
@@ -945,6 +1299,12 @@ static const char g_app_js[] =
     "function applyValues(data){for(const p of PARAMS){if(typeof data[p.key]!=='undefined'){p.slider.value=data[p.key];p.valueLabel.textContent=data[p.key];}}state.defaultsLoaded=true;}\n"
     "function applySingleParamValue(data){if(!data||!data.key)return;const p=PARAMS.find(x=>x.key===data.key);if(!p)return;p.slider.value=data.value;p.valueLabel.textContent=data.value;updateDefaultButtonState(p);}\n"
     "async function saveStartupParams(){setPreviewStatus('Saving startup ISP params...','busy');log('GET /api/params/save');try{await fetchJson('/api/params/save');setPreviewStatus('Startup ISP params saved','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "function renderLedCal(){ui.ledCalGrid.innerHTML='';for(const p of LED_CAL_PARAMS){const card=document.createElement('article');card.className='param-card';card.innerHTML=`<header><label for=\"led-${p.key}\">${p.label}</label><span class=\"value\" id=\"led-value-${p.key}\">-</span></header><input id=\"led-${p.key}\" type=\"range\" min=\"${p.min}\" max=\"${p.max}\" step=\"${p.step}\" value=\"${p.min}\">`;ui.ledCalGrid.appendChild(card);const slider=document.getElementById(`led-${p.key}`);const value=document.getElementById(`led-value-${p.key}`);slider.oninput=()=>{value.textContent=p.format(Number(slider.value));};slider.onchange=()=>setLedCalParam(p.key,slider.value);p.slider=slider;p.valueLabel=value;}}\n"
+    "function applyLedCal(data){if(!data)return;state.ledCal={...state.ledCal,...data};for(const p of LED_CAL_PARAMS){if(typeof state.ledCal[p.json]!=='undefined'&&p.slider&&p.valueLabel){p.slider.value=state.ledCal[p.json];p.valueLabel.textContent=p.format(Number(state.ledCal[p.json]));}}}\n"
+    "async function refreshLedCal(){setLedCalStatus('Refreshing LED calibration...','busy');log('GET /api/led_cal');try{const data=await fetchJson('/api/led_cal');applyLedCal(data);setLedCalStatus(`LED mode: ${data.testMode||'LIVE'}`,'good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function setLedCalParam(key,value){log(`GET /api/led_cal/set?key=${key}&value=${value}`);setLedCalStatus(`Applying ${key}...`,'busy');try{const data=await fetchJson(`/api/led_cal/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`);applyLedCal(data);setLedCalStatus(`Applied ${key}`,'good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function saveLedCal(){log('GET /api/led_cal/save');setLedCalStatus('Saving LED calibration...','busy');try{const data=await fetchJson('/api/led_cal/save');applyLedCal(data);setLedCalStatus('LED calibration saved','good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function setLedTest(mode){log(`GET /api/led_cal/test?mode=${mode}`);setLedCalStatus(`Switching to ${mode}...`,'busy');try{const data=await fetchJson(`/api/led_cal/test?mode=${encodeURIComponent(mode)}`);applyLedCal(data);setLedCalStatus(`LED test mode: ${data.testMode}`,'good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
     "function makeDefaultCalibration(w,h){const left=Math.round(w/8),right=Math.round(w-left),top=Math.round(h/8),bottom=Math.round(h-top),span=right-left,tml=Math.round(left+span/4),cx=Math.round(w/2),tmr=Math.round(right-span/4),cy=Math.round(h/2);return{imageWidth:w,imageHeight:h,points:[{x:left,y:top},{x:tml,y:top},{x:cx,y:top},{x:tmr,y:top},{x:right,y:top},{x:right,y:cy},{x:right,y:bottom},{x:cx,y:bottom},{x:left,y:bottom},{x:left,y:cy}]};}\n"
     "function ensureCalibrationPoints(){if(!state.calibration.points||state.calibration.points.length!==10){state.calibration=makeDefaultCalibration(state.calibration.imageWidth||640,state.calibration.imageHeight||320);}}\n"
     "function drawCalibrationCanvas(){const c=ui.calibrationCanvas,ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle='#f8fbf5';ctx.fillRect(0,0,c.width,c.height);if(state.calibrationImage){ctx.drawImage(state.calibrationImage,0,0,c.width,c.height);}ctx.strokeStyle='rgba(13,107,87,0.85)';ctx.lineWidth=3;ensureCalibrationPoints();ctx.beginPath();state.calibration.points.forEach((p,i)=>{if(i===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y);});ctx.closePath();ctx.stroke();ctx.font='12px sans-serif';state.calibration.points.forEach((p,i)=>{ctx.beginPath();ctx.fillStyle='#d26a2e';ctx.arc(p.x,p.y,7,0,Math.PI*2);ctx.fill();ctx.fillStyle='#132b21';ctx.fillText(POINT_LABELS[i],p.x+10,p.y-10);});}\n"
@@ -967,6 +1327,7 @@ static const char g_app_js[] =
     "async function refreshLayout(){log('GET /api/layout');try{const data=await fetchJson('/api/layout');applyLayoutMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function refreshInstallMode(){log('GET /api/install_mode');try{const data=await fetchJson('/api/install_mode');applyInstallModeMeta(data);}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function setLayout(value){log(`GET /api/layout/set?value=${value}`);try{const data=await fetchJson(`/api/layout/set?value=${encodeURIComponent(value)}`);applyLayoutMeta(data);drawBorderBlocks();if(state.mode==='RUN')await refreshRuntimeBlocks();else await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function setStripProfile(value){log(`GET /api/led_strip/set?value=${value}`);try{const data=await fetchJson(`/api/led_strip/set?value=${encodeURIComponent(value)}`);applyInstallModeMeta(data);setPreviewStatus(`LED strip updated: ${data.stripLabel}`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setInstallMode(value){log(`GET /api/install_mode/set?value=${value}`);try{const data=await fetchJson(`/api/install_mode/set?value=${encodeURIComponent(value)}`);applyInstallModeMeta(data);setPreviewStatus(`Install mapping updated: ${data.label}`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setColorOrder(value){log(`GET /api/color_order/set?value=${value}`);try{const data=await fetchJson(`/api/color_order/set?value=${encodeURIComponent(value)}`);applyInstallModeMeta(data);setPreviewStatus(`LED color order updated: ${data.colorOrder}`,'good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function toggleInstallGuide(){const active=state.installGuideActive?0:1;log(`GET /api/install_guide?active=${active}`);try{const data=await fetchJson(`/api/install_guide?active=${active}`);applyInstallModeMeta(data);setPreviewStatus(state.installGuideActive?'Install guide active: choose direction now':'Install guide locked: saved for next boot','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
@@ -980,7 +1341,7 @@ static const char g_app_js[] =
     "async function captureSnapshot(){if(state.previewBusy)return false;state.previewBusy=true;setPreviewStatus('Capturing snapshot...','busy');const url=`/api/snap?t=${Date.now()}`;log(`GET ${url}`);try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();if(state.previewUrl)URL.revokeObjectURL(state.previewUrl);state.previewUrl=URL.createObjectURL(blob);ui.previewImage.src=state.previewUrl;await waitForImage(ui.previewImage);setPreviewStatus('Preview updated','good');return true;}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');return false;}finally{state.previewBusy=false;}}\n"
     "async function refreshPreviewAndBlocks(){const ok=await captureSnapshot();if(ok)await refreshBorderBlocks();}\n"
     "function startAutoPreview(){if(state.mode==='RUN'){setPreviewStatus('Run mode disables web preview for lowest latency','good');return;}if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';setPreviewStatus('Auto preview stopped');return;}const runner=refreshPreviewAndBlocks;runner();state.autoPreviewTimer=setInterval(()=>runner(),280);ui.autoPreviewBtn.textContent='Stop Auto Preview';setPreviewStatus('Auto preview running','good');}\n"
-    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.wifiScanSelect.onchange=()=>{if(ui.wifiScanSelect.value)ui.wifiSsidInput.value=ui.wifiScanSelect.value;};ui.wifiScanBtn.onclick=scanWiFi;ui.wifiSaveBtn.onclick=saveWiFi;ui.wifiForgetBtn.onclick=forgetWiFi;ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.colorOrderSelect.onchange=()=>setColorOrder(ui.colorOrderSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.saveParamsBtn.onclick=saveStartupParams;ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(refreshWiFiStatus).then(scanWiFi).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});setInterval(()=>refreshWiFiStatus(),5000);\n";
+    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.wifiScanSelect.onchange=()=>{if(ui.wifiScanSelect.value)ui.wifiSsidInput.value=ui.wifiScanSelect.value;};ui.wifiScanBtn.onclick=scanWiFi;ui.wifiSaveBtn.onclick=saveWiFi;ui.wifiForgetBtn.onclick=forgetWiFi;ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.stripProfileSelect.onchange=()=>setStripProfile(ui.stripProfileSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.colorOrderSelect.onchange=()=>setColorOrder(ui.colorOrderSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.saveParamsBtn.onclick=saveStartupParams;ui.ledCalSaveBtn.onclick=saveLedCal;ui.ledTestWhiteBtn.onclick=()=>setLedTest('WHITE');ui.ledTestRedBtn.onclick=()=>setLedTest('RED');ui.ledTestGreenBtn.onclick=()=>setLedTest('GREEN');ui.ledTestBlueBtn.onclick=()=>setLedTest('BLUE');ui.ledTestCyanBtn.onclick=()=>setLedTest('CYAN');ui.ledTestMagentaBtn.onclick=()=>setLedTest('MAGENTA');ui.ledTestYellowBtn.onclick=()=>setLedTest('YELLOW');ui.ledTestLiveBtn.onclick=()=>setLedTest('LIVE');ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();renderLedCal();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(refreshLedCal).then(refreshWiFiStatus).then(scanWiFi).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});setInterval(()=>refreshWiFiStatus(),5000);\n";
 
 static void post_setup_cb(spi_slave_transaction_t *trans)
 {
@@ -2245,8 +2606,8 @@ static void runtime_blocks_task(void *arg)
                 }
                 xSemaphoreGive(g_bridge_lock);
 
-                if (cache_copy.ready) {
-                    esp_err_t led_ret = update_led_strip_from_cache(&cache_copy);
+                if (cache_copy.ready || g_led_test_mode != LED_TEST_MODE_LIVE || g_install_setup_active) {
+                    esp_err_t led_ret = refresh_led_output_from_state();
                     if (led_ret != ESP_OK) {
                         ESP_LOGW(TAG, "LED update failed: %s", esp_err_to_name(led_ret));
                     }
@@ -2428,14 +2789,16 @@ static esp_err_t layout_set_handler(httpd_req_t *req)
 
 static esp_err_t install_mode_get_handler(httpd_req_t *req)
 {
-    char json[224];
+    char json[320];
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"installGuideActive\":%s}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"stripProfile\":\"%s\",\"stripLabel\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
              g_install_mode->label,
              g_led_color_order->name,
+             g_led_strip_profile->name,
+             g_led_strip_profile->label,
              g_install_setup_active ? "true" : "false");
     return send_json(req, json);
 }
@@ -2444,7 +2807,7 @@ static esp_err_t install_mode_set_handler(httpd_req_t *req)
 {
     char query[96];
     char value[32];
-    char json[224];
+    char json[320];
     const led_install_desc_t *desc;
     esp_err_t ret;
 
@@ -2475,10 +2838,12 @@ static esp_err_t install_mode_set_handler(httpd_req_t *req)
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"installGuideActive\":%s}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"stripProfile\":\"%s\",\"stripLabel\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
              g_install_mode->label,
              g_led_color_order->name,
+             g_led_strip_profile->name,
+             g_led_strip_profile->label,
              g_install_setup_active ? "true" : "false");
     return send_json(req, json);
 }
@@ -2487,7 +2852,7 @@ static esp_err_t color_order_set_handler(httpd_req_t *req)
 {
     char query[96];
     char value[16];
-    char json[224];
+    char json[320];
     const led_color_order_desc_t *desc;
     esp_err_t ret;
 
@@ -2522,10 +2887,12 @@ static esp_err_t color_order_set_handler(httpd_req_t *req)
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"installGuideActive\":%s}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"stripProfile\":\"%s\",\"stripLabel\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
              g_install_mode->label,
              g_led_color_order->name,
+             g_led_strip_profile->name,
+             g_led_strip_profile->label,
              g_install_setup_active ? "true" : "false");
     return send_json(req, json);
 }
@@ -2534,7 +2901,7 @@ static esp_err_t install_guide_handler(httpd_req_t *req)
 {
     char query[96];
     char value[8];
-    char json[224];
+    char json[320];
     esp_err_t ret;
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
@@ -2555,7 +2922,7 @@ static esp_err_t install_guide_handler(httpd_req_t *req)
             return send_error_json(req, "install guide failed", HTTPD_500_INTERNAL_SERVER_ERROR);
         }
     } else {
-        ret = sm16703sp3_clear();
+        ret = refresh_led_output_from_state();
         if (ret != ESP_OK) {
             return send_error_json(req, "install guide clear failed", HTTPD_500_INTERNAL_SERVER_ERROR);
         }
@@ -2563,11 +2930,165 @@ static esp_err_t install_guide_handler(httpd_req_t *req)
 
     snprintf(json,
              sizeof(json),
-             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"installGuideActive\":%s}",
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"stripProfile\":\"%s\",\"stripLabel\":\"%s\",\"installGuideActive\":%s}",
              g_install_mode->name,
              g_install_mode->label,
              g_led_color_order->name,
+             g_led_strip_profile->name,
+             g_led_strip_profile->label,
              g_install_setup_active ? "true" : "false");
+    return send_json(req, json);
+}
+
+static esp_err_t strip_profile_set_handler(httpd_req_t *req)
+{
+    char query[96];
+    char value[16];
+    char json[320];
+    const led_strip_profile_desc_t *desc;
+    esp_err_t ret;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return send_error_json(req, "missing strip profile query", HTTPD_400_BAD_REQUEST);
+    }
+    if (httpd_query_key_value(query, "value", value, sizeof(value)) != ESP_OK) {
+        return send_error_json(req, "missing strip profile value", HTTPD_400_BAD_REQUEST);
+    }
+    if (!g_install_setup_active) {
+        return send_error_json(req, "install guide locked", HTTPD_400_BAD_REQUEST);
+    }
+
+    desc = find_strip_profile_desc(value);
+    if (strcmp(desc->name, value) != 0) {
+        return send_error_json(req, "unknown strip profile", HTTPD_400_BAD_REQUEST);
+    }
+
+    g_led_strip_profile = desc;
+    ret = save_install_config();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "strip profile save failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    ret = refresh_led_output_from_state();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "strip profile apply failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    snprintf(json,
+             sizeof(json),
+             "{\"ok\":true,\"installMode\":\"%s\",\"label\":\"%s\",\"colorOrder\":\"%s\",\"stripProfile\":\"%s\",\"stripLabel\":\"%s\",\"installGuideActive\":%s}",
+             g_install_mode->name,
+             g_install_mode->label,
+             g_led_color_order->name,
+             g_led_strip_profile->name,
+             g_led_strip_profile->label,
+             g_install_setup_active ? "true" : "false");
+    return send_json(req, json);
+}
+
+static void build_led_calibration_json(char *json, size_t json_size)
+{
+    snprintf(json,
+             json_size,
+             "{\"ok\":true,\"rGain\":%u,\"gGain\":%u,\"bGain\":%u,"
+             "\"rGamma\":%u,\"gGamma\":%u,\"bGamma\":%u,\"testMode\":\"%s\"}",
+             (unsigned)g_led_cal.gain[0],
+             (unsigned)g_led_cal.gain[1],
+             (unsigned)g_led_cal.gain[2],
+             (unsigned)g_led_cal.gamma[0],
+             (unsigned)g_led_cal.gamma[1],
+             (unsigned)g_led_cal.gamma[2],
+             led_test_mode_name(g_led_test_mode));
+}
+
+static esp_err_t led_calibration_get_handler(httpd_req_t *req)
+{
+    char json[192];
+
+    build_led_calibration_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t led_calibration_set_handler(httpd_req_t *req)
+{
+    char query[128];
+    char key[24];
+    char value_str[16];
+    int value;
+    char json[192];
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return send_error_json(req, "missing led cal query", HTTPD_400_BAD_REQUEST);
+    }
+    if (httpd_query_key_value(query, "key", key, sizeof(key)) != ESP_OK) {
+        return send_error_json(req, "missing led cal key", HTTPD_400_BAD_REQUEST);
+    }
+    if (httpd_query_key_value(query, "value", value_str, sizeof(value_str)) != ESP_OK) {
+        return send_error_json(req, "missing led cal value", HTTPD_400_BAD_REQUEST);
+    }
+
+    value = atoi(value_str);
+    if (strcmp(key, "R_GAIN") == 0) {
+        g_led_cal.gain[0] = (uint16_t)((value < 0) ? 0 : (value > 100 ? 100 : value));
+    } else if (strcmp(key, "G_GAIN") == 0) {
+        g_led_cal.gain[1] = (uint16_t)((value < 0) ? 0 : (value > 100 ? 100 : value));
+    } else if (strcmp(key, "B_GAIN") == 0) {
+        g_led_cal.gain[2] = (uint16_t)((value < 0) ? 0 : (value > 100 ? 100 : value));
+    } else if (strcmp(key, "R_GAMMA") == 0) {
+        g_led_cal.gamma[0] = (uint16_t)((value < 50) ? 50 : (value > 300 ? 300 : value));
+    } else if (strcmp(key, "G_GAMMA") == 0) {
+        g_led_cal.gamma[1] = (uint16_t)((value < 50) ? 50 : (value > 300 ? 300 : value));
+    } else if (strcmp(key, "B_GAMMA") == 0) {
+        g_led_cal.gamma[2] = (uint16_t)((value < 50) ? 50 : (value > 300 ? 300 : value));
+    } else {
+        return send_error_json(req, "unknown led cal key", HTTPD_400_BAD_REQUEST);
+    }
+
+    rebuild_led_color_lut();
+    if (refresh_led_output_from_state() != ESP_OK && g_led_test_mode != LED_TEST_MODE_LIVE) {
+        return send_error_json(req, "apply led calibration failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    build_led_calibration_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t led_calibration_save_handler(httpd_req_t *req)
+{
+    char json[192];
+    esp_err_t ret = save_led_color_calibration();
+
+    if (ret != ESP_OK) {
+        return send_error_json(req, "led calibration save failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    build_led_calibration_json(json, sizeof(json));
+    return send_json(req, json);
+}
+
+static esp_err_t led_calibration_test_handler(httpd_req_t *req)
+{
+    char query[64];
+    char value[16];
+    char json[192];
+    esp_err_t ret;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return send_error_json(req, "missing led test query", HTTPD_400_BAD_REQUEST);
+    }
+    if (httpd_query_key_value(query, "mode", value, sizeof(value)) != ESP_OK) {
+        return send_error_json(req, "missing led test mode", HTTPD_400_BAD_REQUEST);
+    }
+
+    g_led_test_mode = led_test_mode_from_name(value);
+    if (strcmp(value, "LIVE") != 0 && strcmp(led_test_mode_name(g_led_test_mode), value) != 0) {
+        return send_error_json(req, "unknown led test mode", HTTPD_400_BAD_REQUEST);
+    }
+
+    ret = refresh_led_output_from_state();
+    if (ret != ESP_OK) {
+        return send_error_json(req, "led test apply failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    build_led_calibration_json(json, sizeof(json));
     return send_json(req, json);
 }
 
@@ -2906,6 +3427,12 @@ static esp_err_t start_http_server(void)
         .handler = install_mode_set_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t strip_profile_set = {
+        .uri = "/api/led_strip/set",
+        .method = HTTP_GET,
+        .handler = strip_profile_set_handler,
+        .user_ctx = NULL,
+    };
     httpd_uri_t color_order_set = {
         .uri = "/api/color_order/set",
         .method = HTTP_GET,
@@ -2916,6 +3443,30 @@ static esp_err_t start_http_server(void)
         .uri = "/api/install_guide",
         .method = HTTP_GET,
         .handler = install_guide_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t led_cal_get = {
+        .uri = "/api/led_cal",
+        .method = HTTP_GET,
+        .handler = led_calibration_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t led_cal_set = {
+        .uri = "/api/led_cal/set",
+        .method = HTTP_GET,
+        .handler = led_calibration_set_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t led_cal_save = {
+        .uri = "/api/led_cal/save",
+        .method = HTTP_GET,
+        .handler = led_calibration_save_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t led_cal_test = {
+        .uri = "/api/led_cal/test",
+        .method = HTTP_GET,
+        .handler = led_calibration_test_handler,
         .user_ctx = NULL,
     };
     httpd_uri_t wifi_status = {
@@ -3009,7 +3560,7 @@ static esp_err_t start_http_server(void)
         .user_ctx = NULL,
     };
     config.stack_size = 10240;
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 32;
 
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
@@ -3020,8 +3571,13 @@ static esp_err_t start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &layout_set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &install_mode_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &install_mode_set));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &strip_profile_set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &color_order_set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &install_guide));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &led_cal_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &led_cal_set));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &led_cal_save));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &led_cal_test));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_status));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_save));
@@ -3178,6 +3734,7 @@ void app_main(void)
     load_install_config();
     load_wifi_config();
     load_saved_isp_params();
+    load_led_color_calibration();
 
     g_bridge_lock = xSemaphoreCreateMutex();
     assert(g_bridge_lock != NULL);
@@ -3198,10 +3755,16 @@ void app_main(void)
     }));
     ESP_ERROR_CHECK(sm16703sp3_set_color_order(g_led_color_order->order));
     ESP_LOGI(TAG,
-             "Install config loaded: mode=%s colorOrder=%s active=%d",
+             "Install config loaded: mode=%s colorOrder=%s active=%d ledCal=[%u,%u,%u]/[%u,%u,%u]",
              g_install_mode->name,
              g_led_color_order->name,
-             g_install_setup_active);
+             g_install_setup_active,
+             (unsigned)g_led_cal.gain[0],
+             (unsigned)g_led_cal.gain[1],
+             (unsigned)g_led_cal.gain[2],
+             (unsigned)g_led_cal.gamma[0],
+             (unsigned)g_led_cal.gamma[1],
+             (unsigned)g_led_cal.gamma[2]);
     if (g_install_setup_active) {
         ESP_ERROR_CHECK(show_install_guide_pattern());
     } else {
