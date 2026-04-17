@@ -6,10 +6,11 @@
 
 1. [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)
 2. [校正算法详解](/home/kuan/T23-C3-Project/docs/rectification_algorithm_zh.md)
-3. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
-4. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
-5. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
-6. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
+3. [Python/T23 算法同步说明](/home/kuan/T23-C3-Project/docs/python_rectification_sync_zh.md)
+4. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
+5. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
+6. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
+7. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
 
 总指南里现在已经统一包含：
 
