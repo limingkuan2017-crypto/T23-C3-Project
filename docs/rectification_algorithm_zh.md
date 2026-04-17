@@ -22,7 +22,7 @@
 - 基于固定鱼眼标定参数的 8 点校正模型
 - 在鱼眼去畸变后的坐标系里拟合四条边
 - 再通过单个 `homography` 拉成规则矩形
-- 最后在规则矩形里选一个满足约束的 `16:9` crop
+- 最后在规则矩形里选一个“内容优先、无黑边、比例自然”的最终显示区域
 
 这套实现的特点是：
 
@@ -156,15 +156,7 @@
 
 - 构造完整的 `rectification_model_t`
 - 优先走 fixed fisheye 主路径
-- 计算 `TM` 经过 homography 后在 rectified 图中的位置 `tm_rect_y`
 - 再调用 crop 逻辑得到最终 `crop_left / crop_top / crop_width / crop_height`
-
-这里的 `tm_rect_y` 非常重要：
-
-- 它不是顶边中点
-- 而是 `TM` 这个用户点被映射到 rectified 图后的 `y`
-
-后面的顶部安全约束都基于它。
 
 ## 6. Crop 为什么这样设计
 
@@ -184,18 +176,18 @@
 - 哪些 crop 会带黑边
 - 哪些 crop 是完全有效的
 
-### 6.2 用积分图加速候选框评分
+### 6.2 用积分图加速候选框判定
 
 函数：
 
 - `build_invalid_integral_image()`
 - `count_invalid_pixels()`
-- `score_centered_crop()`
+- `rectified_rect_is_valid()`
 
 职责：
 
 - 先把无效像素构造成积分图
-- 每个候选 `16:9` 框的无效像素数改成 O(1) 计算
+- 每个候选矩形的无效像素数改成 O(1) 计算
 - 避免 T23 在大范围搜索时因逐像素统计而导致 `HTTP 500`
 
 这是当前版本很重要的一次工程修正：
@@ -203,31 +195,35 @@
 - 几何策略没变
 - 但性能从“每个候选框遍历整块 ROI”降到了常数时间统计
 
-### 6.3 最终 16:9 crop 选择
+### 6.3 最终内容选择与自适应 crop
 
 函数：
 
-- `find_centered_16x9_crop()`
+- `compute_required_content_bounds()`
+- `find_nearest_valid_seed()`
+- `expand_valid_crop_greedy()`
 - `finalize_rectification_crop()`
 
 职责：
 
-- 在 rectified 画布中找一个尽量居中的 `16:9` crop
-- 同时满足顶部安全约束
-- 优先选择满足有效率要求的最大候选框
+- 先在 rectified 坐标系里找出“必须保留内容”
+- 再在不产生黑边的前提下，把这个内容框尽量向外扩张
+- 最后得到一个不强制 `16:9`、但比例尽量自然的 crop
 
 当前关键约束：
 
-- `safe_top = floor(tm_rect_y - 10)`
-- crop 顶部不能高于 `safe_top`
+- 用户框选出的电视内容必须尽量完整保留
+- 最终 crop 必须完全落在 `valid mask` 内，避免黑边
+- 比例只作为弱偏好，不再为了固定 `16:9` 主动裁掉上下内容
 
-当前实现还做了一个非常关键的修正：
+当前实现的真实步骤是：
 
-- 当 `safe_top` 生效时，不能只在顶部附近做局部小范围搜索
-- 否则虽然头顶不黑，但会把下身裁掉
-- 现在会在可行的纵向范围内继续搜索，从而把底部空间尽量拿回来
+1. 先根据 `TM / LM / RM / BL / BM / BR` 和当前顶边弱参考模型，投影出一组“必须保留内容点”
+2. 用这些点形成最小外接框，作为内容硬约束
+3. 如果这个框刚好触到无效区，先找到最近的有效种子点
+4. 再按左、上、右、下及组合方向，贪心扩张出最大的全有效矩形
 
-这也是“顶部黑块消失，同时机器猫下身尽量保留”的根本原因。
+这也是“顶部不再黑、下身尽量保留、俯仰变化时仍然更稳定”的根本原因。
 
 ## 7. 为什么现在能和 Python 对齐
 
@@ -236,8 +232,8 @@
 1. `knew` 只缩放 `fx / fy`，不重置 `cx / cy`
 2. 顶边不是直接由 `TL / TR` 决定，而是由左右边外推 + 弱混合
 3. `TL/TR` 在鱼眼边缘的无效判定和 OpenCV 对齐
-4. `safe_top` 使用 `TM` 过 homography 后的 `tm_rect_y`
-5. crop 搜索同时考虑 `16:9`、中心偏好、有效区域和 `safe_top`
+4. rectified 画布尺寸按 `quad` 自适应估算，不再强制 `16:9`
+5. 最终 crop 以“内容完整 + 全有效”为主，而不是 `TM/safe_top`
 
 因此现在的网页版本和 Python 调参工具，在视觉行为上已经对齐到同一套几何模型，而不是只是“看起来差不多”。
 
@@ -324,7 +320,9 @@
 | `build_rectification_model()` | 生成完整 rectification model，并计算 crop |
 | `build_direct_valid_mask()` | 计算整张 rectified 画布的有效区域 |
 | `build_invalid_integral_image()` | 为 crop 搜索建立无效像素积分图 |
-| `find_centered_16x9_crop()` | 搜索满足约束的最佳 16:9 crop |
+| `compute_required_content_bounds()` | 计算 rectified 空间中的必须保留内容框 |
+| `find_nearest_valid_seed()` | 为内容框寻找最近的有效种子点 |
+| `expand_valid_crop_greedy()` | 在保证全有效的前提下尽量放大 crop |
 | `finalize_rectification_crop()` | 汇总 crop 约束并写回 model |
 | `compute_average_rectified_patch()` | 在 rectified crop 上统计单块平均颜色 |
 | `compute_border_blocks()` | 按布局输出边框块颜色 |

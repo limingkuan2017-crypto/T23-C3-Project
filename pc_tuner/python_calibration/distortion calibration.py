@@ -90,19 +90,25 @@ def compute_rectified_size_from_quad(quad):
     width_est = max(top_len, bottom_len)
     height_est = max(left_len, right_len)
 
-    width = int(round(clamp(width_est, 320, RECTIFIED_MAX_W)))
-    height = int(round(width * 9.0 / 16.0))
+    scale = 1.0
 
-    if height > RECTIFIED_MAX_H:
-        height = RECTIFIED_MAX_H
-        width = int(round(height * 16.0 / 9.0))
+    if width_est < 1.0:
+        width_est = 320.0
+    if height_est < 1.0:
+        height_est = 180.0
 
-    if height_est > height:
-        height = int(round(clamp(height_est, 180, RECTIFIED_MAX_H)))
-        width = int(round(height * 16.0 / 9.0))
-        if width > RECTIFIED_MAX_W:
-            width = RECTIFIED_MAX_W
-            height = int(round(width * 9.0 / 16.0))
+    if width_est < 320.0 or height_est < 180.0:
+        min_scale_w = 320.0 / width_est
+        min_scale_h = 180.0 / height_est
+        scale = max(min_scale_w, min_scale_h)
+
+    if width_est * scale > RECTIFIED_MAX_W or height_est * scale > RECTIFIED_MAX_H:
+        max_scale_w = RECTIFIED_MAX_W / width_est
+        max_scale_h = RECTIFIED_MAX_H / height_est
+        scale = min(max_scale_w, max_scale_h)
+
+    width = int(round(width_est * scale))
+    height = int(round(height_est * scale))
 
     width = clamp(width, 320, RECTIFIED_MAX_W)
     height = clamp(height, 180, RECTIFIED_MAX_H)
@@ -289,78 +295,174 @@ def count_invalid_pixels(invalid_integral, x, y, w, h):
     )
 
 
-def score_centered_crop(invalid_integral, x, y, w, h, desired_center):
-    total = w * h
-    if total <= 0:
-        return -1e18, 0.0
-
-    invalid = count_invalid_pixels(invalid_integral, x, y, w, h)
-    ratio = float(total - invalid) / float(total)
-    crop_cx = x + w * 0.5
-    crop_cy = y + h * 0.5
-    dist2 = (crop_cx - desired_center[0]) ** 2 + (crop_cy - desired_center[1]) ** 2
-    score = total + ratio * 1e6 - dist2 * 4.0
-    return score, ratio
+def rectified_rect_is_valid(invalid_integral, left, top, right, bottom):
+    if left > right or top > bottom:
+        return False
+    return count_invalid_pixels(
+        invalid_integral,
+        left,
+        top,
+        right - left + 1,
+        bottom - top + 1,
+    ) == 0
 
 
-def find_centered_16x9_crop(valid_mask, desired_center, min_top=0, min_valid_ratio=1.0):
-    h, w = valid_mask.shape
-    target_ratio = 16.0 / 9.0
-    invalid_integral = build_invalid_integral_image(valid_mask)
+def crop_aspect_error(width, height, desired_aspect):
+    if width <= 0 or height <= 0 or desired_aspect <= 0.0:
+        return float("inf")
+    aspect = float(width) / float(height)
+    return abs(math.log(aspect / desired_aspect))
 
-    best = None
-    best_score = -1e18
-    min_top = int(clamp(min_top, 0, h - 1))
 
-    for ch in range(h - min_top, 179, -4):
-        cw = int(round(ch * target_ratio))
-        if cw > w:
-            continue
+def consider_crop_candidate(invalid_integral, mask_shape, left, top, right, bottom, desired_aspect, current_area, best):
+    mask_h, mask_w = mask_shape
+    if left < 0 or top < 0 or right >= mask_w or bottom >= mask_h:
+        return best
+    if not rectified_rect_is_valid(invalid_integral, left, top, right, bottom):
+        return best
 
-        x0 = int(round(desired_center[0] - cw * 0.5))
-        y0 = int(round(desired_center[1] - ch * 0.5))
+    width = right - left + 1
+    height = bottom - top + 1
+    area = width * height
+    if area < current_area:
+        return best
 
-        x0 = int(clamp(x0, 0, w - cw))
-        y0 = int(clamp(y0, min_top, h - ch))
-
-        search_dx = min(40, max(8, cw // 40))
-        search_dy = min(30, max(6, ch // 40))
-        if min_top > 0:
-            # Match T23: when TM headroom constrains crop top, keep searching
-            # the full feasible vertical span so we do not shrink the crop
-            # prematurely and cut off lower content.
-            search_dy = max(0, h - ch - min_top)
-        step_x = max(2, search_dx // 5)
-        step_y = 2 if min_top > 0 else max(2, search_dy // 5)
-
-        local_best = None
-        local_best_score = -1e18
-
-        for dy in range(-search_dy, search_dy + 1, step_y):
-            for dx in range(-search_dx, search_dx + 1, step_x):
-                x = int(clamp(x0 + dx, 0, w - cw))
-                y = int(clamp(y0 + dy, min_top, h - ch))
-                score, ratio = score_centered_crop(invalid_integral, x, y, cw, ch, desired_center)
-                if score > local_best_score:
-                    local_best_score = score
-                    local_best = (x, y, cw, ch, ratio)
-
-        if local_best is not None:
-            x, y, cw, ch, ratio = local_best
-            if ratio >= min_valid_ratio and local_best_score > best_score:
-                best_score = local_best_score
-                best = (x, y, cw, ch, ratio)
-                break
-            elif best is None and local_best_score > best_score:
-                best_score = local_best_score
-                best = (x, y, cw, ch, ratio)
-
-    if best is None:
-        return 0, 0, w, h, 0.0
+    error = crop_aspect_error(width, height, desired_aspect)
+    if best is None or area > best[4] or (area == best[4] and error < best[5]):
+        return (left, top, right, bottom, area, error)
     return best
 
 
-def rectify_from_raw_with_tm_crop(raw_img, hmat, out_size, knew, k, d, tm_rect_y, top_margin=10):
+def expand_valid_crop_greedy(invalid_integral, valid_mask, desired_aspect, left, top, right, bottom):
+    mask_shape = valid_mask.shape
+    while True:
+        current_area = (right - left + 1) * (bottom - top + 1)
+        best = None
+        for candidate in (
+            (left - 1, top, right, bottom),
+            (left, top - 1, right, bottom),
+            (left, top, right + 1, bottom),
+            (left, top, right, bottom + 1),
+            (left - 1, top, right + 1, bottom),
+            (left, top - 1, right, bottom + 1),
+            (left - 1, top - 1, right, bottom),
+            (left, top - 1, right + 1, bottom),
+            (left - 1, top, right, bottom + 1),
+            (left, top, right + 1, bottom + 1),
+            (left - 1, top - 1, right + 1, bottom + 1),
+        ):
+            best = consider_crop_candidate(
+                invalid_integral,
+                mask_shape,
+                candidate[0],
+                candidate[1],
+                candidate[2],
+                candidate[3],
+                desired_aspect,
+                current_area,
+                best,
+            )
+        if best is None:
+            break
+        left, top, right, bottom = best[:4]
+    return left, top, right, bottom
+
+
+def find_nearest_valid_seed(valid_mask, center_x, center_y):
+    h, w = valid_mask.shape
+    center_x = int(clamp(center_x, 0, w - 1))
+    center_y = int(clamp(center_y, 0, h - 1))
+    if valid_mask[center_y, center_x]:
+        return center_x, center_y
+
+    limit = max(w, h)
+    for radius in range(1, limit):
+        x0 = int(clamp(center_x - radius, 0, w - 1))
+        x1 = int(clamp(center_x + radius, 0, w - 1))
+        y0 = int(clamp(center_y - radius, 0, h - 1))
+        y1 = int(clamp(center_y + radius, 0, h - 1))
+        for x in range(x0, x1 + 1):
+            if valid_mask[y0, x]:
+                return x, y0
+            if valid_mask[y1, x]:
+                return x, y1
+        for y in range(y0 + 1, y1):
+            if valid_mask[y, x0]:
+                return x0, y
+            if valid_mask[y, x1]:
+                return x1, y
+    raise RuntimeError("no valid seed found in rectified mask")
+
+
+def rectified_point_usable(pt):
+    return bool(np.isfinite(pt[0]) and np.isfinite(pt[1]) and abs(pt[0]) < 100000.0 and abs(pt[1]) < 100000.0)
+
+
+def accumulate_projected_content_point(hmat, src_pt, bounds):
+    if not rectified_point_usable(src_pt):
+        return bounds
+    src = np.asarray(src_pt, dtype=np.float32).reshape(1, 1, 2)
+    rect_pt = cv2.perspectiveTransform(src, hmat).reshape(2)
+    if not np.isfinite(rect_pt).all():
+        return bounds
+
+    min_x, min_y, max_x, max_y, have_point = bounds
+    if not have_point:
+        return float(rect_pt[0]), float(rect_pt[1]), float(rect_pt[0]), float(rect_pt[1]), True
+    return (
+        min(min_x, float(rect_pt[0])),
+        min(min_y, float(rect_pt[1])),
+        max(max_x, float(rect_pt[0])),
+        max(max_y, float(rect_pt[1])),
+        True,
+    )
+
+
+def compute_required_content_bounds(pts_und, hmat, out_size, top_corner_user_blend=0.18):
+    bounds = (0.0, 0.0, 0.0, 0.0, False)
+    for name in ["TM", "LM", "RM", "BL", "BM", "BR"]:
+        bounds = accumulate_projected_content_point(hmat, pts_und[IDX[name]], bounds)
+
+    if rectified_point_usable(pts_und[IDX["BL"]]) and rectified_point_usable(pts_und[IDX["LM"]]):
+        tl_pred = 2.0 * pts_und[IDX["LM"]] - pts_und[IDX["BL"]]
+        if rectified_point_usable(pts_und[IDX["TL"]]):
+            tl_ref = tl_pred * (1.0 - top_corner_user_blend) + pts_und[IDX["TL"]] * top_corner_user_blend
+        else:
+            tl_ref = tl_pred
+        bounds = accumulate_projected_content_point(hmat, tl_ref, bounds)
+
+    if rectified_point_usable(pts_und[IDX["BR"]]) and rectified_point_usable(pts_und[IDX["RM"]]):
+        tr_pred = 2.0 * pts_und[IDX["RM"]] - pts_und[IDX["BR"]]
+        if rectified_point_usable(pts_und[IDX["TR"]]):
+            tr_ref = tr_pred * (1.0 - top_corner_user_blend) + pts_und[IDX["TR"]] * top_corner_user_blend
+        else:
+            tr_ref = tr_pred
+        bounds = accumulate_projected_content_point(hmat, tr_ref, bounds)
+
+    min_x, min_y, max_x, max_y, have_point = bounds
+    if not have_point:
+        raise RuntimeError("failed to compute required content bounds")
+
+    out_w, out_h = out_size
+    left = int(clamp(math.floor(min_x), 0, out_w - 1))
+    top = int(clamp(math.floor(min_y), 0, out_h - 1))
+    right = int(clamp(math.ceil(max_x), left, out_w - 1))
+    bottom = int(clamp(math.ceil(max_y), top, out_h - 1))
+    return left, top, right, bottom
+
+
+def rectify_from_raw_with_tm_crop(
+    raw_img,
+    hmat,
+    out_size,
+    knew,
+    k,
+    d,
+    tm_rect_y,
+    top_margin=10,
+    pts_und=None,
+    top_corner_user_blend=0.18,
+):
     map_x, map_y, valid = build_direct_rectify_map_from_raw(
         hmat, out_size, knew, k, d, raw_img.shape
     )
@@ -375,15 +477,35 @@ def rectify_from_raw_with_tm_crop(raw_img, hmat, out_size, knew, k, d, tm_rect_y
     )
 
     out_w, out_h = out_size
-    desired_center = np.array([out_w * 0.5, out_h * 0.5], dtype=np.float32)
-    safe_top = int(clamp(math.floor(tm_rect_y - top_margin), 0, rectified_full.shape[0] - 1))
+    desired_aspect = float(out_w) / float(out_h) if out_h > 0 else 16.0 / 9.0
+    invalid_integral = build_invalid_integral_image(valid)
 
-    x, y, cw, ch, ratio = find_centered_16x9_crop(
+    if pts_und is not None:
+        left, top, right, bottom = compute_required_content_bounds(
+            pts_und, hmat, out_size, top_corner_user_blend=top_corner_user_blend
+        )
+        if not rectified_rect_is_valid(invalid_integral, left, top, right, bottom):
+            seed_x, seed_y = find_nearest_valid_seed(valid, int(round(out_w * 0.5)), int(round(out_h * 0.5)))
+            left = right = seed_x
+            top = bottom = seed_y
+    else:
+        seed_x, seed_y = find_nearest_valid_seed(valid, int(round(out_w * 0.5)), int(round(out_h * 0.5)))
+        left = right = seed_x
+        top = bottom = seed_y
+
+    left, top, right, bottom = expand_valid_crop_greedy(
+        invalid_integral,
         valid,
-        desired_center=desired_center,
-        min_top=safe_top,
-        min_valid_ratio=1.0,
+        desired_aspect,
+        left,
+        top,
+        right,
+        bottom,
     )
+    x = left
+    y = top
+    cw = right - left + 1
+    ch = bottom - top + 1
 
     rectified_crop = rectified_full[y:y + ch, x:x + cw]
     valid_crop = valid[y:y + ch, x:x + cw]
@@ -507,6 +629,8 @@ class CalibrationApp:
             self.d,
             tm_rect_y=float(tm_rect[1]),
             top_margin=10,
+            pts_und=pts_und,
+            top_corner_user_blend=self.top_corner_user_blend,
         )
 
         rect_preview = cv2.resize(rectified_crop, (PANEL_W, PANEL_H), interpolation=cv2.INTER_LINEAR)

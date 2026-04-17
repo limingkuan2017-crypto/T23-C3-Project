@@ -894,20 +894,31 @@ static void compute_rectified_size_from_quad(const pointf_t quad[4], int *out_w,
     double left_len = pointf_distance(quad[3], quad[0]);
     double width_est = (top_len > bottom_len) ? top_len : bottom_len;
     double height_est = (left_len > right_len) ? left_len : right_len;
-    int width = (int)lrint(width_est);
-    int height = (int)lrint(height_est);
+    double scale = 1.0;
+    int width;
+    int height;
 
-    width = clamp_int(width, 320, RECTIFIED_MAX_WIDTH);
-    height = (int)lrint((double)width * 9.0 / 16.0);
-
-    if (height > RECTIFIED_MAX_HEIGHT || (double)height < height_est) {
-        height = clamp_int((int)lrint(height_est), 180, RECTIFIED_MAX_HEIGHT);
-        width = (int)lrint((double)height * 16.0 / 9.0);
-        if (width > RECTIFIED_MAX_WIDTH) {
-            width = RECTIFIED_MAX_WIDTH;
-            height = (int)lrint((double)width * 9.0 / 16.0);
-        }
+    if (width_est < 1.0) {
+        width_est = 320.0;
     }
+    if (height_est < 1.0) {
+        height_est = 180.0;
+    }
+
+    if (width_est < 320.0 || height_est < 180.0) {
+        double min_scale_w = 320.0 / width_est;
+        double min_scale_h = 180.0 / height_est;
+        scale = (min_scale_w > min_scale_h) ? min_scale_w : min_scale_h;
+    }
+    if (width_est * scale > (double)RECTIFIED_MAX_WIDTH ||
+        height_est * scale > (double)RECTIFIED_MAX_HEIGHT) {
+        double max_scale_w = (double)RECTIFIED_MAX_WIDTH / width_est;
+        double max_scale_h = (double)RECTIFIED_MAX_HEIGHT / height_est;
+        scale = (max_scale_w < max_scale_h) ? max_scale_w : max_scale_h;
+    }
+
+    width = (int)lrint(width_est * scale);
+    height = (int)lrint(height_est * scale);
 
     width = clamp_int(width, 320, RECTIFIED_MAX_WIDTH);
     height = clamp_int(height, 180, RECTIFIED_MAX_HEIGHT);
@@ -1265,160 +1276,367 @@ static uint32_t count_invalid_pixels(const uint32_t *integral,
            integral[y2 * stride + x] + integral[y * stride + x];
 }
 
-static double score_centered_crop(const uint32_t *invalid_integral,
-                                  int integral_stride,
-                                  int x,
-                                  int y,
-                                  int w,
-                                  int h,
-                                  double desired_cx,
-                                  double desired_cy,
-                                  double *ratio_out)
+static int rectified_rect_is_valid(const uint32_t *invalid_integral,
+                                   int integral_stride,
+                                   int left,
+                                   int top,
+                                   int right,
+                                   int bottom)
 {
-    int total = w * h;
-    uint32_t invalid;
-    double crop_cx;
-    double crop_cy;
-    double dist2;
-
-    if (w <= 0 || h <= 0 || total <= 0) {
-        *ratio_out = 0.0;
-        return -1e18;
+    if (left > right || top > bottom) {
+        return 0;
     }
-
-    invalid = count_invalid_pixels(invalid_integral, integral_stride, x, y, w, h);
-    *ratio_out = (double)(total - (int)invalid) / (double)total;
-    crop_cx = (double)x + (double)w * 0.5;
-    crop_cy = (double)y + (double)h * 0.5;
-    dist2 = (crop_cx - desired_cx) * (crop_cx - desired_cx) +
-            (crop_cy - desired_cy) * (crop_cy - desired_cy);
-    return (double)total + (*ratio_out) * 1000000.0 - dist2 * 4.0;
+    return count_invalid_pixels(invalid_integral,
+                                integral_stride,
+                                left,
+                                top,
+                                right - left + 1,
+                                bottom - top + 1) == 0;
 }
 
-static void find_centered_16x9_crop(const uint8_t *valid_mask,
-                                    const uint32_t *invalid_integral,
+static double crop_aspect_error(int width, int height, double desired_aspect)
+{
+    double aspect;
+
+    if (width <= 0 || height <= 0 || desired_aspect <= 0.0) {
+        return DBL_MAX;
+    }
+    aspect = (double)width / (double)height;
+    return fabs(log(aspect / desired_aspect));
+}
+
+static void consider_crop_candidate(const uint32_t *invalid_integral,
+                                    int integral_stride,
                                     int mask_w,
                                     int mask_h,
-                                    double desired_cx,
-                                    double desired_cy,
-                                    int min_top,
-                                    double min_valid_ratio,
-                                    int *crop_x_out,
-                                    int *crop_y_out,
-                                    int *crop_w_out,
-                                    int *crop_h_out,
-                                    double *ratio_out)
+                                    int left,
+                                    int top,
+                                    int right,
+                                    int bottom,
+                                    double desired_aspect,
+                                    int current_area,
+                                    int *best_found,
+                                    int *best_left,
+                                    int *best_top,
+                                    int *best_right,
+                                    int *best_bottom,
+                                    int *best_area,
+                                    double *best_error)
 {
-    int best_x = 0;
-    int best_y = 0;
-    int best_w = mask_w;
-    int best_h = mask_h;
-    double best_ratio = 0.0;
-    double best_score = -1e18;
-    int found_good = 0;
-    int ch;
+    int width;
+    int height;
+    int area;
+    double error;
 
-    (void)valid_mask;
-    int integral_stride = mask_w + 1;
+    if (left < 0 || top < 0 || right >= mask_w || bottom >= mask_h) {
+        return;
+    }
+    if (!rectified_rect_is_valid(invalid_integral, integral_stride, left, top, right, bottom)) {
+        return;
+    }
 
-    min_top = clamp_int(min_top, 0, mask_h - 1);
-    for (ch = mask_h - min_top; ch > 179; ch -= 4) {
-        int cw = (int)lrint((double)ch * 16.0 / 9.0);
-        int x0;
-        int y0;
-        int search_dx;
-        int search_dy;
-        int step_x;
-        int step_y;
-        int dx;
-        int dy;
-        double local_best_score = -1e18;
-        int local_found = 0;
-        int local_x = 0;
-        int local_y = 0;
-        double local_ratio = 0.0;
+    width = right - left + 1;
+    height = bottom - top + 1;
+    area = width * height;
+    if (area < current_area) {
+        return;
+    }
 
-        if (cw > mask_w) {
-            continue;
-        }
+    error = crop_aspect_error(width, height, desired_aspect);
+    if (!*best_found ||
+        area > *best_area ||
+        (area == *best_area && error < *best_error)) {
+        *best_found = 1;
+        *best_left = left;
+        *best_top = top;
+        *best_right = right;
+        *best_bottom = bottom;
+        *best_area = area;
+        *best_error = error;
+    }
+}
 
-        x0 = clamp_int((int)lrint(desired_cx - (double)cw * 0.5), 0, mask_w - cw);
-        y0 = clamp_int((int)lrint(desired_cy - (double)ch * 0.5), min_top, mask_h - ch);
+static void expand_valid_crop_greedy(const uint32_t *invalid_integral,
+                                     int integral_stride,
+                                     int mask_w,
+                                     int mask_h,
+                                     double desired_aspect,
+                                     int *left_io,
+                                     int *top_io,
+                                     int *right_io,
+                                     int *bottom_io)
+{
+    int left = *left_io;
+    int top = *top_io;
+    int right = *right_io;
+    int bottom = *bottom_io;
 
-        search_dx = clamp_int(cw / 40, 8, 40);
-        search_dy = clamp_int(ch / 40, 6, 30);
-        if (min_top > 0) {
-            /*
-             * When crop top is constrained by TM headroom, the best fully valid
-             * 16:9 crop may sit noticeably lower than the centered guess.
-             * Search the full feasible vertical span so we do not shrink the
-             * crop prematurely and cut off the lower content.
-             */
-            search_dy = mask_h - ch - min_top;
-            if (search_dy < 0) {
-                search_dy = 0;
-            }
-        }
-        step_x = clamp_int(search_dx / 5, 2, 1000);
-        step_y = (min_top > 0) ? 2 : clamp_int(search_dy / 5, 2, 1000);
+    while (1) {
+        int current_area = (right - left + 1) * (bottom - top + 1);
+        int best_found = 0;
+        int best_left = left;
+        int best_top = top;
+        int best_right = right;
+        int best_bottom = bottom;
+        int best_area = current_area;
+        double best_error = crop_aspect_error(right - left + 1,
+                                              bottom - top + 1,
+                                              desired_aspect);
 
-        for (dy = -search_dy; dy <= search_dy; dy += step_y) {
-            for (dx = -search_dx; dx <= search_dx; dx += step_x) {
-                int x = clamp_int(x0 + dx, 0, mask_w - cw);
-                int y = clamp_int(y0 + dy, min_top, mask_h - ch);
-                double ratio = 0.0;
-                double score = score_centered_crop(invalid_integral,
-                                                   integral_stride,
-                                                   x,
-                                                   y,
-                                                   cw,
-                                                   ch,
-                                                   desired_cx,
-                                                   desired_cy,
-                                                   &ratio);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left - 1, top, right, bottom,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left, top - 1, right, bottom,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left, top, right + 1, bottom,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left, top, right, bottom + 1,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left - 1, top, right + 1, bottom,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left, top - 1, right, bottom + 1,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left - 1, top - 1, right, bottom,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left, top - 1, right + 1, bottom,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left - 1, top, right, bottom + 1,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left, top, right + 1, bottom + 1,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
+        consider_crop_candidate(invalid_integral, integral_stride, mask_w, mask_h,
+                                left - 1, top - 1, right + 1, bottom + 1,
+                                desired_aspect, current_area,
+                                &best_found, &best_left, &best_top, &best_right, &best_bottom,
+                                &best_area, &best_error);
 
-                if (score > local_best_score) {
-                    local_best_score = score;
-                    local_x = x;
-                    local_y = y;
-                    local_ratio = ratio;
-                    local_found = 1;
-                }
-            }
-        }
-
-        if (!local_found) {
-            continue;
-        }
-
-        if (local_ratio >= min_valid_ratio) {
-            if (!found_good || local_best_score > best_score) {
-                best_score = local_best_score;
-                best_x = local_x;
-                best_y = local_y;
-                best_w = cw;
-                best_h = ch;
-                best_ratio = local_ratio;
-                found_good = 1;
-            }
+        if (!best_found) {
             break;
         }
 
-        if (!found_good && local_best_score > best_score) {
-            best_score = local_best_score;
-            best_x = local_x;
-            best_y = local_y;
-            best_w = cw;
-            best_h = ch;
-            best_ratio = local_ratio;
+        left = best_left;
+        top = best_top;
+        right = best_right;
+        bottom = best_bottom;
+    }
+
+    *left_io = left;
+    *top_io = top;
+    *right_io = right;
+    *bottom_io = bottom;
+}
+
+static int find_nearest_valid_seed(const uint8_t *valid_mask,
+                                   int mask_w,
+                                   int mask_h,
+                                   int center_x,
+                                   int center_y,
+                                   int *x_out,
+                                   int *y_out)
+{
+    int radius;
+
+    center_x = clamp_int(center_x, 0, mask_w - 1);
+    center_y = clamp_int(center_y, 0, mask_h - 1);
+    if (valid_mask[center_y * mask_w + center_x]) {
+        *x_out = center_x;
+        *y_out = center_y;
+        return 0;
+    }
+
+    for (radius = 1; radius < (mask_w > mask_h ? mask_w : mask_h); ++radius) {
+        int x0 = clamp_int(center_x - radius, 0, mask_w - 1);
+        int x1 = clamp_int(center_x + radius, 0, mask_w - 1);
+        int y0 = clamp_int(center_y - radius, 0, mask_h - 1);
+        int y1 = clamp_int(center_y + radius, 0, mask_h - 1);
+        int x;
+        int y;
+
+        for (x = x0; x <= x1; ++x) {
+            if (valid_mask[y0 * mask_w + x]) {
+                *x_out = x;
+                *y_out = y0;
+                return 0;
+            }
+            if (valid_mask[y1 * mask_w + x]) {
+                *x_out = x;
+                *y_out = y1;
+                return 0;
+            }
+        }
+        for (y = y0 + 1; y < y1; ++y) {
+            if (valid_mask[y * mask_w + x0]) {
+                *x_out = x0;
+                *y_out = y;
+                return 0;
+            }
+            if (valid_mask[y * mask_w + x1]) {
+                *x_out = x1;
+                *y_out = y;
+                return 0;
+            }
         }
     }
 
-    *crop_x_out = best_x;
-    *crop_y_out = best_y;
-    *crop_w_out = best_w;
-    *crop_h_out = best_h;
-    *ratio_out = best_ratio;
+    return -1;
+}
+
+static int rectified_point_usable(const pointf_t *pt)
+{
+    return isfinite(pt->x) && isfinite(pt->y) &&
+           fabs(pt->x) < 100000.0 && fabs(pt->y) < 100000.0;
+}
+
+static void accumulate_projected_content_point(const rectification_model_t *model,
+                                               const pointf_t *src_pt,
+                                               double *min_x,
+                                               double *min_y,
+                                               double *max_x,
+                                               double *max_y,
+                                               int *have_point)
+{
+    pointf_t rect_pt;
+
+    if (!rectified_point_usable(src_pt)) {
+        return;
+    }
+    if (apply_homography(model->homography, src_pt->x, src_pt->y, &rect_pt) < 0) {
+        return;
+    }
+    if (!isfinite(rect_pt.x) || !isfinite(rect_pt.y)) {
+        return;
+    }
+
+    if (!*have_point) {
+        *min_x = *max_x = rect_pt.x;
+        *min_y = *max_y = rect_pt.y;
+        *have_point = 1;
+        return;
+    }
+
+    if (rect_pt.x < *min_x) {
+        *min_x = rect_pt.x;
+    }
+    if (rect_pt.y < *min_y) {
+        *min_y = rect_pt.y;
+    }
+    if (rect_pt.x > *max_x) {
+        *max_x = rect_pt.x;
+    }
+    if (rect_pt.y > *max_y) {
+        *max_y = rect_pt.y;
+    }
+}
+
+static int compute_required_content_bounds(const rectification_model_t *model,
+                                           int *left_out,
+                                           int *top_out,
+                                           int *right_out,
+                                           int *bottom_out)
+{
+    static const unsigned int content_idx[] = {
+        T23_BORDER_POINT_TM,
+        T23_BORDER_POINT_LM,
+        T23_BORDER_POINT_RM,
+        T23_BORDER_POINT_BL,
+        T23_BORDER_POINT_BM,
+        T23_BORDER_POINT_BR
+    };
+    double min_x = 0.0;
+    double min_y = 0.0;
+    double max_x = 0.0;
+    double max_y = 0.0;
+    int have_point = 0;
+    unsigned int i;
+
+    for (i = 0; i < sizeof(content_idx) / sizeof(content_idx[0]); ++i) {
+        accumulate_projected_content_point(model,
+                                           &model->pts_undistorted[content_idx[i]],
+                                           &min_x,
+                                           &min_y,
+                                           &max_x,
+                                           &max_y,
+                                           &have_point);
+    }
+
+    if (rectified_point_usable(&model->pts_undistorted[T23_BORDER_POINT_BL]) &&
+        rectified_point_usable(&model->pts_undistorted[T23_BORDER_POINT_LM])) {
+        pointf_t tl_pred;
+        pointf_t tl_ref;
+
+        tl_pred.x = 2.0 * model->pts_undistorted[T23_BORDER_POINT_LM].x -
+                    model->pts_undistorted[T23_BORDER_POINT_BL].x;
+        tl_pred.y = 2.0 * model->pts_undistorted[T23_BORDER_POINT_LM].y -
+                    model->pts_undistorted[T23_BORDER_POINT_BL].y;
+        if (rectified_point_usable(&model->pts_undistorted[T23_BORDER_POINT_TL])) {
+            tl_ref.x = tl_pred.x * (1.0 - TOP_CORNER_USER_BLEND) +
+                       model->pts_undistorted[T23_BORDER_POINT_TL].x * TOP_CORNER_USER_BLEND;
+            tl_ref.y = tl_pred.y * (1.0 - TOP_CORNER_USER_BLEND) +
+                       model->pts_undistorted[T23_BORDER_POINT_TL].y * TOP_CORNER_USER_BLEND;
+        } else {
+            tl_ref = tl_pred;
+        }
+        accumulate_projected_content_point(model, &tl_ref, &min_x, &min_y, &max_x, &max_y, &have_point);
+    }
+
+    if (rectified_point_usable(&model->pts_undistorted[T23_BORDER_POINT_BR]) &&
+        rectified_point_usable(&model->pts_undistorted[T23_BORDER_POINT_RM])) {
+        pointf_t tr_pred;
+        pointf_t tr_ref;
+
+        tr_pred.x = 2.0 * model->pts_undistorted[T23_BORDER_POINT_RM].x -
+                    model->pts_undistorted[T23_BORDER_POINT_BR].x;
+        tr_pred.y = 2.0 * model->pts_undistorted[T23_BORDER_POINT_RM].y -
+                    model->pts_undistorted[T23_BORDER_POINT_BR].y;
+        if (rectified_point_usable(&model->pts_undistorted[T23_BORDER_POINT_TR])) {
+            tr_ref.x = tr_pred.x * (1.0 - TOP_CORNER_USER_BLEND) +
+                       model->pts_undistorted[T23_BORDER_POINT_TR].x * TOP_CORNER_USER_BLEND;
+            tr_ref.y = tr_pred.y * (1.0 - TOP_CORNER_USER_BLEND) +
+                       model->pts_undistorted[T23_BORDER_POINT_TR].y * TOP_CORNER_USER_BLEND;
+        } else {
+            tr_ref = tr_pred;
+        }
+        accumulate_projected_content_point(model, &tr_ref, &min_x, &min_y, &max_x, &max_y, &have_point);
+    }
+
+    if (!have_point) {
+        return -1;
+    }
+
+    *left_out = clamp_int((int)floor(min_x), 0, model->rectified_width - 1);
+    *top_out = clamp_int((int)floor(min_y), 0, model->rectified_height - 1);
+    *right_out = clamp_int((int)ceil(max_x), *left_out, model->rectified_width - 1);
+    *bottom_out = clamp_int((int)ceil(max_y), *top_out, model->rectified_height - 1);
+    return 0;
 }
 
 static int finalize_rectification_crop(rectification_model_t *model, int src_w, int src_h)
@@ -1427,7 +1645,13 @@ static int finalize_rectification_crop(rectification_model_t *model, int src_w, 
     uint32_t *invalid_integral = NULL;
     double desired_cx = (double)model->rectified_width * 0.5;
     double desired_cy = (double)model->rectified_height * 0.5;
-    int safe_top;
+    double desired_aspect = (model->rectified_height > 0) ?
+                            ((double)model->rectified_width / (double)model->rectified_height) :
+                            (16.0 / 9.0);
+    int left;
+    int top;
+    int right;
+    int bottom;
 
     valid_mask = malloc((size_t)model->rectified_width * (size_t)model->rectified_height);
     if (valid_mask == NULL) {
@@ -1441,26 +1665,54 @@ static int finalize_rectification_crop(rectification_model_t *model, int src_w, 
         return -1;
     }
 
-    safe_top = clamp_int((int)floor(model->tm_rect_y - 10.0), 0, model->rectified_height - 1);
-
     build_direct_valid_mask(model, src_w, src_h, valid_mask);
     build_invalid_integral_image(valid_mask,
                                  model->rectified_width,
                                  model->rectified_height,
                                  invalid_integral);
-    find_centered_16x9_crop(valid_mask,
-                            invalid_integral,
-                            model->rectified_width,
-                            model->rectified_height,
-                            desired_cx,
-                            desired_cy,
-                            safe_top,
-                            1.0,
-                            &model->crop_left,
-                            &model->crop_top,
-                            &model->crop_width,
-                            &model->crop_height,
-                            &model->crop_valid_ratio);
+
+    if (compute_required_content_bounds(model, &left, &top, &right, &bottom) < 0 ||
+        !rectified_rect_is_valid(invalid_integral,
+                                 model->rectified_width + 1,
+                                 left,
+                                 top,
+                                 right,
+                                 bottom)) {
+        int seed_x = 0;
+        int seed_y = 0;
+
+        if (find_nearest_valid_seed(valid_mask,
+                                    model->rectified_width,
+                                    model->rectified_height,
+                                    (int)lrint(desired_cx),
+                                    (int)lrint(desired_cy),
+                                    &seed_x,
+                                    &seed_y) < 0) {
+            free(invalid_integral);
+            free(valid_mask);
+            return -1;
+        }
+        left = seed_x;
+        right = seed_x;
+        top = seed_y;
+        bottom = seed_y;
+    }
+
+    expand_valid_crop_greedy(invalid_integral,
+                             model->rectified_width + 1,
+                             model->rectified_width,
+                             model->rectified_height,
+                             desired_aspect,
+                             &left,
+                             &top,
+                             &right,
+                             &bottom);
+
+    model->crop_left = left;
+    model->crop_top = top;
+    model->crop_width = right - left + 1;
+    model->crop_height = bottom - top + 1;
+    model->crop_valid_ratio = 1.0;
 
     free(invalid_integral);
     free(valid_mask);

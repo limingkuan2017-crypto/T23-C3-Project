@@ -1,79 +1,96 @@
 # Python/T23 算法同步说明
 
-这份说明专门记录桌面 Python 调参工具与当前 `T23` 固件之间，已经统一的那部分校正算法实现。
+这份说明记录桌面 Python 调参工具与当前 `T23` 固件之间，已经统一到同一套实现的校正逻辑。
 
-当前 GitHub 仓库里的 Python 参考代码在：
+当前仓库里的 Python 代码在：
 
+- [pc_tuner/python_calibration/distortion calibration.py](/home/kuan/T23-C3-Project/pc_tuner/python_calibration/distortion%20calibration.py)
 - [pc_tuner/python_rectification_reference.py](/home/kuan/T23-C3-Project/pc_tuner/python_rectification_reference.py)
 
 本地 Windows 调参脚本在：
 
 - `C:\Code\T23-C3-Project\Python\distortion calibration.py`
 
+## 当前统一后的结论
+
 两边现在保持一致的核心点是：
 
-1. `TM` 先过 `homography` 得到 `tm_rect_y`
-2. `safe_top = floor(tm_rect_y - 10)`
-3. `safe_top` 不是事后再把 crop 往下推，而是直接带进 `16:9 crop` 搜索
-4. crop 优先选择 `100% valid` 的候选框
-5. 当 `safe_top` 生效时，纵向搜索会覆盖完整可行范围，避免“头部保住了、下身又被切掉”
-6. 有效像素统计统一改成“invalid integral image”，避免逐像素统计带来的性能问题
+1. `TL/TR` 仍然只是顶边的弱参考，顶边主体由 `BL/LM`、`BR/RM` 外推出来。
+2. `knew` 仍然只缩放 `fx/fy`，不重置 `cx/cy`。
+3. rectified 基础画布尺寸不再强制压成 `16:9`，而是按当前拟合出的 `quad` 宽高自适应估算。
+4. 最终输出不再为了 `16:9` 主动裁掉上下内容。
+5. crop 选择改成“内容完整优先，再保证无黑边，最后才兼顾比例自然”。
+6. Python 和 T23 都用无效像素积分图做候选框判定，行为一致，性能也一致。
 
 ## 函数职责
+
+### `compute_rectified_size_from_quad(quad)`
+
+- 根据当前 `quad` 的四边长度估算 rectified 画布尺寸
+- 不再固定输出 `16:9`
+- 只在最小尺寸和最大尺寸约束内做缩放
 
 ### `build_invalid_integral_image(valid_mask)`
 
 - 输入 rectified 画布上的 `valid mask`
 - 输出“无效像素积分图”
-- 作用是把任意 ROI 的无效像素数计算，从逐像素遍历降到 `O(1)`
+- 让任意候选矩形的无效像素统计降为 `O(1)`
 
-### `count_invalid_pixels(invalid_integral, x, y, w, h)`
+### `rectified_rect_is_valid(invalid_integral, left, top, right, bottom)`
 
-- 从积分图里读取指定候选框的无效像素总数
-- 这是 crop 评分的基础统计函数
+- 判断一个 rectified 矩形是否完全有效
+- 这是“不要黑边”的最基本判定函数
 
-### `score_centered_crop(invalid_integral, x, y, w, h, desired_center)`
+### `compute_required_content_bounds(pts_und, hmat, out_size, top_corner_user_blend)`
 
-- 计算一个候选 crop 的评分
-- 评分由三部分组成：
-  - 面积越大越好
-  - 有效像素比例越高越好
-  - 离目标中心越近越好
+- 把“用户框选出的电视内容”投影到 rectified 坐标系
+- 用 `TM / LM / RM / BL / BM / BR` 以及按当前顶边模型外推的 `TL/TR` 参考点
+- 输出一个“必须保留内容”的最小外接框
 
-### `find_centered_16x9_crop(valid_mask, desired_center, min_top, min_valid_ratio)`
+### `find_nearest_valid_seed(valid_mask, center_x, center_y)`
 
-- 在 rectified 画布里搜索最终使用的 `16:9` crop
-- `min_top` 对应 `safe_top`
-- 先尝试找到满足 `min_valid_ratio` 的最大候选框
-- 如果 `safe_top` 生效，会把纵向搜索范围放大到完整可行区间，而不是只在中心附近小范围试探
+- 当“必须保留内容框”本身落到了无效区时
+- 从其中心附近找到最近的有效起点
+- 避免整套 crop 因边缘个别无效点直接失败
 
-### `rectify_from_raw_with_tm_crop(raw_img, hmat, out_size, knew, k, d, tm_rect_y, top_margin)`
+### `expand_valid_crop_greedy(invalid_integral, valid_mask, desired_aspect, left, top, right, bottom)`
 
-- 这是 Python 端与 T23 对齐后的总入口
-- 先生成整张 `rectified_full`
-- 再基于 `TM -> safe_top` 和 `valid mask` 选出最终 crop
-- 返回：
-  - `rectified_full`
-  - `rectified_crop`
-  - `valid_crop`
-  - `(x, y, w, h, valid_ratio)` 裁剪信息
+- 从当前有效种子框开始，按左、上、右、下以及组合方向逐步扩展
+- 只接受完全有效的新矩形
+- 在“内容已保留”的前提下尽量把范围做大
+- `desired_aspect` 只作为平手时的弱偏好，不再主导裁剪
+
+### `rectify_from_raw_with_tm_crop(raw_img, hmat, out_size, knew, k, d, tm_rect_y, top_margin, pts_und, top_corner_user_blend)`
+
+- 保留了原函数名，方便 Python UI 侧少改调用关系
+- 实际行为已经不再依赖 `TM -> safe_top -> 16:9 crop`
+- 现在流程是：
+  1. 生成整张 `rectified_full`
+  2. 计算 `valid mask`
+  3. 投影“必须保留内容框”
+  4. 以它为中心扩展出最大的全有效矩形
+  5. 返回最终 `rectified_crop`
 
 ## 这次统一修掉的历史差异
 
-之前 Python 端存在这条旧逻辑：
+之前 Python 和较早的 T23 版本都带过这类旧行为：
 
-1. 先找一个 `min_valid_ratio=0.95` 的局部居中 crop
-2. 再在搜索完成后，用 `safe_top` 把结果强制往下推
+1. 先生成 rectified 图
+2. 再找一个看起来更舒服的 `16:9` crop
+3. 为了避免黑边，会进一步压缩顶部或底部
 
-这会带来两个问题：
+这样做的问题是：
 
-- 顶部黑块和底部裁切之间会互相拉扯
-- 和当前 T23 固件的结果不完全一致
+- 摄像头俯仰一变化，最终显示范围也会明显变化
+- 明明用户已经把电视边框框准了，输出内容还是可能被切掉
+- “画面完整”和“没有黑边”之间经常互相拉扯
 
-现在已经改成与 T23 相同的逻辑：
+现在已经统一改成：
 
-- 搜索时直接考虑 `safe_top`
-- 优先 `100% valid`
-- 用积分图加速候选框评分
+- 保持原有 8 点拟合和弱顶角模型不动
+- 只改最后的内容选择策略
+- 输出尽量完整保留用户框选出的电视内容
+- 同时尽量不带黑边
+- 不再为固定 `16:9` 比例牺牲上下内容
 
-这样桌面 Python 结果和网页/T23 结果会更稳定地对齐。
+这也是当前 Python 调参窗口与 T23 网页预览能够重新对齐的关键原因。

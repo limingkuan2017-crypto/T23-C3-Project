@@ -20,7 +20,7 @@
 - 关键函数功能表
 - 当前校正算法与灯带链路说明
 
-如果你只关心这次和 Python 对齐后的校正实现，直接看：
+如果你只关心这次和 Python 对齐后的校正实现，直接看这套“弱顶角拟合 + 内容优先、自适应比例 crop”的说明：
 
 - [校正算法详解](/home/kuan/T23-C3-Project/docs/rectification_algorithm_zh.md)
 
