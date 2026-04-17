@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <stdio.h>
 #include <jpeglib.h>
 #include <linux/spi/spidev.h>
@@ -21,6 +22,7 @@
 #include <imp/imp_system.h>
 
 #include "camera_common.h"
+#include "fisheye_valid_mask_640x320.h"
 #include "t23_border_pipeline.h"
 #include "t23_c3_protocol.h"
 
@@ -31,6 +33,38 @@
 #define RECTIFIED_JPEG_QUALITY 75
 #define RECTIFIED_MAX_WIDTH 640
 #define RECTIFIED_MAX_HEIGHT 360
+#define HIRES_SNAPSHOT_WIDTH 1280
+#define HIRES_SNAPSHOT_HEIGHT 720
+#define FISHEYE_CALIB_WIDTH 640
+#define FISHEYE_CALIB_HEIGHT 320
+#define FISHEYE_FX 297.22593501
+#define FISHEYE_FY 263.50077004
+#define FISHEYE_CX 317.25653706
+#define FISHEYE_CY 215.36940626
+#define FISHEYE_K1 -0.11463113
+#define FISHEYE_K2 -0.04991202
+#define FISHEYE_K3 0.08392980
+#define FISHEYE_K4 -0.03815913
+#define FISHEYE_KNEW_SCALE 0.56
+#define FISHEYE_UI_KNEW_SCALE 0.50
+#define FISHEYE_UI_CX_OFFSET 0.0
+#define FISHEYE_UI_CY_OFFSET 14.0
+#define RECTIFY_FISHEYE_BLEND 0.42
+#define TOP_CORNER_USER_BLEND 0.18
+
+/*
+ * Current debug setup:
+ * - 27" 16:9 display => about 33.6 cm visible height
+ * - camera-to-screen distance about 11 cm
+ * - top edge midpoint sits about 5 cm above the visible estimate when the
+ *   camera is mounted above the TV
+ *
+ * Use these as a geometric prior to expand the top edge slightly more than
+ * the old fixed 12% heuristic so the rectified preview keeps more headroom.
+ */
+#define DISPLAY_HEIGHT_CM 33.6
+#define CAMERA_DISTANCE_CM 11.0
+#define TOP_EDGE_OFFSET_CM 5.0
 
 #define SPI_DEVICE "/dev/spidev0.0"
 #define SPI_MODE_DEFAULT SPI_MODE_0
@@ -58,6 +92,42 @@ typedef struct {
     double x;
     double y;
 } pointf_t;
+
+typedef struct {
+    double a;
+    double b;
+    double c;
+} line2d_t;
+
+typedef struct {
+    pointf_t pts_distorted[T23_BORDER_POINT_COUNT];
+    pointf_t pts_undistorted[T23_BORDER_POINT_COUNT];
+    pointf_t pts_expanded[T23_BORDER_POINT_COUNT];
+    double cx;
+    double cy;
+    double scale;
+    double k1;
+    int use_fisheye;
+    double fish_fx;
+    double fish_fy;
+    double fish_cx;
+    double fish_cy;
+    double fish_k[4];
+    double fish_fx_new;
+    double fish_fy_new;
+    double fish_cx_new;
+    double fish_cy_new;
+    double homography[9];
+    double homography_inv[9];
+    int rectified_width;
+    int rectified_height;
+    int crop_left;
+    int crop_top;
+    int crop_width;
+    int crop_height;
+    double crop_valid_ratio;
+    double tm_rect_y;
+} rectification_model_t;
 
 typedef enum {
     BRIDGE_MODE_DEBUG = 0,
@@ -91,6 +161,9 @@ static void sendf(int fd, const char *fmt, ...);
 static int capture_jpeg_once(unsigned char *out_buf, size_t *out_len);
 static int push_jpeg_over_spi(const unsigned char *jpeg_buf, size_t jpeg_len);
 static void process_command(int fd, char *line);
+static int startup_pipeline_with_cfg(const sample_sensor_cfg_t *sensor_cfg);
+static int finalize_rectification_crop(rectification_model_t *model, int src_w, int src_h);
+static void sanitize_calibration(t23_border_calibration_t *cal);
 
 static const char *bridge_mode_name(bridge_mode_t mode)
 {
@@ -186,43 +259,49 @@ static sample_sensor_cfg_t make_sensor_cfg(void)
     return cfg;
 }
 
+static sample_sensor_cfg_t make_sensor_cfg_with_size(int width, int height)
+{
+    sample_sensor_cfg_t cfg = make_sensor_cfg();
+
+    cfg.sensor_width = width;
+    cfg.sensor_height = height;
+    cfg.chn0_en = 1;
+    cfg.chn1_en = 0;
+    cfg.chn2_en = 0;
+    cfg.chn3_en = 0;
+    return cfg;
+}
+
 static void init_default_calibration(void)
 {
     int w = SENSOR_WIDTH;
     int h = SENSOR_HEIGHT;
-    int left = w / 8;
-    int right = w - left;
-    int top = h / 8;
-    int bottom = h - top;
-    int top_left_mid = left + (right - left) / 4;
-    int cx = w / 2;
-    int top_right_mid = right - (right - left) / 4;
-    int cy = h / 2;
 
     memset(&g_calibration, 0, sizeof(g_calibration));
     g_calibration.image_width = (uint16_t)w;
     g_calibration.image_height = (uint16_t)h;
 
-    g_calibration.points[T23_BORDER_POINT_TL].x = (int16_t)left;
-    g_calibration.points[T23_BORDER_POINT_TL].y = (int16_t)top;
-    g_calibration.points[T23_BORDER_POINT_TML].x = (int16_t)top_left_mid;
-    g_calibration.points[T23_BORDER_POINT_TML].y = (int16_t)top;
-    g_calibration.points[T23_BORDER_POINT_TM].x = (int16_t)cx;
-    g_calibration.points[T23_BORDER_POINT_TM].y = (int16_t)top;
-    g_calibration.points[T23_BORDER_POINT_TMR].x = (int16_t)top_right_mid;
-    g_calibration.points[T23_BORDER_POINT_TMR].y = (int16_t)top;
-    g_calibration.points[T23_BORDER_POINT_TR].x = (int16_t)right;
-    g_calibration.points[T23_BORDER_POINT_TR].y = (int16_t)top;
-    g_calibration.points[T23_BORDER_POINT_RM].x = (int16_t)right;
-    g_calibration.points[T23_BORDER_POINT_RM].y = (int16_t)cy;
-    g_calibration.points[T23_BORDER_POINT_BR].x = (int16_t)right;
-    g_calibration.points[T23_BORDER_POINT_BR].y = (int16_t)bottom;
-    g_calibration.points[T23_BORDER_POINT_BM].x = (int16_t)cx;
-    g_calibration.points[T23_BORDER_POINT_BM].y = (int16_t)bottom;
-    g_calibration.points[T23_BORDER_POINT_BL].x = (int16_t)left;
-    g_calibration.points[T23_BORDER_POINT_BL].y = (int16_t)bottom;
-    g_calibration.points[T23_BORDER_POINT_LM].x = (int16_t)left;
-    g_calibration.points[T23_BORDER_POINT_LM].y = (int16_t)cy;
+    /*
+     * Match the Python tuner defaults so "reset" starts from the same
+     * trapezoid instead of a flat top-edge rectangle.
+     */
+    g_calibration.points[T23_BORDER_POINT_TL].x = (int16_t)lrint((double)w * 0.02);
+    g_calibration.points[T23_BORDER_POINT_TL].y = (int16_t)lrint((double)h * 0.42);
+    g_calibration.points[T23_BORDER_POINT_TM].x = (int16_t)lrint((double)w * 0.50);
+    g_calibration.points[T23_BORDER_POINT_TM].y = (int16_t)lrint((double)h * 0.23);
+    g_calibration.points[T23_BORDER_POINT_TR].x = (int16_t)lrint((double)w * 0.98);
+    g_calibration.points[T23_BORDER_POINT_TR].y = (int16_t)lrint((double)h * 0.42);
+    g_calibration.points[T23_BORDER_POINT_RM].x = (int16_t)lrint((double)w * 0.90);
+    g_calibration.points[T23_BORDER_POINT_RM].y = (int16_t)lrint((double)h * 0.54);
+    g_calibration.points[T23_BORDER_POINT_BR].x = (int16_t)lrint((double)w * 0.80);
+    g_calibration.points[T23_BORDER_POINT_BR].y = (int16_t)lrint((double)h * 0.65);
+    g_calibration.points[T23_BORDER_POINT_BM].x = (int16_t)lrint((double)w * 0.50);
+    g_calibration.points[T23_BORDER_POINT_BM].y = (int16_t)lrint((double)h * 0.64);
+    g_calibration.points[T23_BORDER_POINT_BL].x = (int16_t)lrint((double)w * 0.18);
+    g_calibration.points[T23_BORDER_POINT_BL].y = (int16_t)lrint((double)h * 0.64);
+    g_calibration.points[T23_BORDER_POINT_LM].x = (int16_t)lrint((double)w * 0.08);
+    g_calibration.points[T23_BORDER_POINT_LM].y = (int16_t)lrint((double)h * 0.54);
+    sanitize_calibration(&g_calibration);
 }
 
 static void sanitize_calibration(t23_border_calibration_t *cal)
@@ -265,28 +344,501 @@ static pointf_t pointf_bezier2(pointf_t p0, pointf_t p1, pointf_t p2, double t)
     return out;
 }
 
-static pointf_t pointf_bezier4(pointf_t p0, pointf_t p1, pointf_t p2, pointf_t p3, pointf_t p4, double t)
+static double point_set_line_residual(const pointf_t *pts, unsigned int count)
 {
-    double omt = 1.0 - t;
-    double omt2 = omt * omt;
-    double omt3 = omt2 * omt;
-    double omt4 = omt3 * omt;
-    double t2 = t * t;
-    double t3 = t2 * t;
-    double t4 = t3 * t;
-    pointf_t out;
+    double mean_x = 0.0;
+    double mean_y = 0.0;
+    double sxx = 0.0;
+    double sxy = 0.0;
+    double syy = 0.0;
+    double disc;
+    double lambda_min;
+    unsigned int i;
 
-    out.x = omt4 * p0.x +
-            4.0 * omt3 * t * p1.x +
-            6.0 * omt2 * t2 * p2.x +
-            4.0 * omt * t3 * p3.x +
-            t4 * p4.x;
-    out.y = omt4 * p0.y +
-            4.0 * omt3 * t * p1.y +
-            6.0 * omt2 * t2 * p2.y +
-            4.0 * omt * t3 * p3.y +
-            t4 * p4.y;
-    return out;
+    if (count < 2u) {
+        return 0.0;
+    }
+
+    for (i = 0; i < count; ++i) {
+        mean_x += pts[i].x;
+        mean_y += pts[i].y;
+    }
+    mean_x /= (double)count;
+    mean_y /= (double)count;
+
+    for (i = 0; i < count; ++i) {
+        double dx = pts[i].x - mean_x;
+        double dy = pts[i].y - mean_y;
+
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+
+    disc = (sxx - syy) * (sxx - syy) + 4.0 * sxy * sxy;
+    lambda_min = 0.5 * (sxx + syy - sqrt(disc));
+    return lambda_min / (double)count;
+}
+
+static int fit_line_tls(const pointf_t *pts, unsigned int count, line2d_t *line)
+{
+    double mean_x = 0.0;
+    double mean_y = 0.0;
+    double sxx = 0.0;
+    double sxy = 0.0;
+    double syy = 0.0;
+    double theta;
+    double dir_x;
+    double dir_y;
+    double norm;
+    unsigned int i;
+
+    if (count < 2u) {
+        return -1;
+    }
+
+    for (i = 0; i < count; ++i) {
+        mean_x += pts[i].x;
+        mean_y += pts[i].y;
+    }
+    mean_x /= (double)count;
+    mean_y /= (double)count;
+
+    for (i = 0; i < count; ++i) {
+        double dx = pts[i].x - mean_x;
+        double dy = pts[i].y - mean_y;
+
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+
+    theta = 0.5 * atan2(2.0 * sxy, sxx - syy);
+    dir_x = cos(theta);
+    dir_y = sin(theta);
+    norm = sqrt(dir_x * dir_x + dir_y * dir_y);
+    if (norm < 1e-9) {
+        return -1;
+    }
+
+    dir_x /= norm;
+    dir_y /= norm;
+
+    line->a = -dir_y;
+    line->b = dir_x;
+    line->c = -(line->a * mean_x + line->b * mean_y);
+    return 0;
+}
+
+static int intersect_lines(const line2d_t *l1, const line2d_t *l2, pointf_t *out)
+{
+    double det = l1->a * l2->b - l2->a * l1->b;
+
+    if (fabs(det) < 1e-9) {
+        return -1;
+    }
+
+    out->x = (l1->b * l2->c - l2->b * l1->c) / det;
+    out->y = (l2->a * l1->c - l1->a * l2->c) / det;
+    return 0;
+}
+
+static int undistort_point_with_k1(const pointf_t *distorted,
+                                   double cx,
+                                   double cy,
+                                   double scale,
+                                   double k1,
+                                   pointf_t *undistorted)
+{
+    double xd = (distorted->x - cx) / scale;
+    double yd = (distorted->y - cy) / scale;
+    double xu = xd;
+    double yu = yd;
+    int iter;
+
+    for (iter = 0; iter < 8; ++iter) {
+        double ru2 = xu * xu + yu * yu;
+        double factor = 1.0 + k1 * ru2;
+
+        if (factor < 0.15) {
+            return -1;
+        }
+
+        xu = xd / factor;
+        yu = yd / factor;
+    }
+
+    undistorted->x = xu * scale + cx;
+    undistorted->y = yu * scale + cy;
+    return 0;
+}
+
+static int distort_point_with_k1(const rectification_model_t *model,
+                                 const pointf_t *undistorted,
+                                 pointf_t *distorted)
+{
+    double xu = (undistorted->x - model->cx) / model->scale;
+    double yu = (undistorted->y - model->cy) / model->scale;
+    double ru2 = xu * xu + yu * yu;
+    double factor = 1.0 + model->k1 * ru2;
+
+    if (factor < 0.15) {
+        return -1;
+    }
+
+    distorted->x = xu * factor * model->scale + model->cx;
+    distorted->y = yu * factor * model->scale + model->cy;
+    return 0;
+}
+
+static int init_fisheye_profile(rectification_model_t *model,
+                                int src_w,
+                                int src_h,
+                                double knew_scale,
+                                double cx_offset,
+                                double cy_offset)
+{
+    if (src_w != FISHEYE_CALIB_WIDTH || src_h != FISHEYE_CALIB_HEIGHT) {
+        return -1;
+    }
+
+    model->use_fisheye = 1;
+    model->fish_fx = FISHEYE_FX;
+    model->fish_fy = FISHEYE_FY;
+    model->fish_cx = FISHEYE_CX;
+    model->fish_cy = FISHEYE_CY;
+    model->fish_k[0] = FISHEYE_K1;
+    model->fish_k[1] = FISHEYE_K2;
+    model->fish_k[2] = FISHEYE_K3;
+    model->fish_k[3] = FISHEYE_K4;
+
+    /*
+     * Match the Python calibration tool: build knew by scaling only fx/fy
+     * while keeping the calibrated principal point cx/cy unchanged.
+     * Optional UI offsets are applied on top only for the calibration canvas.
+     */
+    model->fish_fx_new = FISHEYE_FX * knew_scale;
+    model->fish_fy_new = FISHEYE_FY * knew_scale;
+    model->fish_cx_new = FISHEYE_CX + cx_offset;
+    model->fish_cy_new = FISHEYE_CY + cy_offset;
+    return 0;
+}
+
+static int init_fixed_fisheye_profile(rectification_model_t *model, int src_w, int src_h)
+{
+    /*
+     * Final rectification uses a moderate widened FOV that keeps the TV image
+     * complete without introducing too much geometric stretch.
+     */
+    return init_fisheye_profile(model, src_w, src_h, FISHEYE_KNEW_SCALE, 0.0, 0.0);
+}
+
+static int fisheye_point_is_valid_by_opencv_mask(const pointf_t *distorted)
+{
+    int x = (int)lrint(distorted->x);
+    int y = (int)lrint(distorted->y);
+    size_t index;
+    unsigned char bits;
+
+    if (x < 0 || x >= FISHEYE_VALID_MASK_W || y < 0 || y >= FISHEYE_VALID_MASK_H) {
+        return 0;
+    }
+
+    index = (size_t)y * (size_t)FISHEYE_VALID_MASK_W + (size_t)x;
+    bits = g_fisheye_valid_mask_640x320[index >> 3];
+    return (bits >> (index & 7)) & 0x1;
+}
+
+static int init_calibration_fisheye_profile(rectification_model_t *model, int src_w, int src_h)
+{
+    /*
+     * The calibration canvas prioritizes visibility of the top screen border
+     * and both upper corners over visual neatness. A smaller virtual focal
+     * length plus a slight downward shift makes dragging points far more stable
+     * than calibrating directly on the tighter final-rectification view.
+     */
+    return init_fisheye_profile(model,
+                                src_w,
+                                src_h,
+                                FISHEYE_UI_KNEW_SCALE,
+                                FISHEYE_UI_CX_OFFSET,
+                                FISHEYE_UI_CY_OFFSET);
+}
+
+static int undistort_point_with_fisheye(const rectification_model_t *model,
+                                        const pointf_t *distorted,
+                                        pointf_t *undistorted)
+{
+    double xd = (distorted->x - model->fish_cx) / model->fish_fx;
+    double yd = (distorted->y - model->fish_cy) / model->fish_fy;
+    double rd = sqrt(xd * xd + yd * yd);
+    double theta_d;
+    double theta;
+    int iter;
+
+    if (!fisheye_point_is_valid_by_opencv_mask(distorted)) {
+        return -1;
+    }
+
+    if (rd < 1e-12) {
+        undistorted->x = model->fish_cx_new;
+        undistorted->y = model->fish_cy_new;
+        return 0;
+    }
+
+    theta_d = rd;
+    theta = theta_d;
+    for (iter = 0; iter < 10; ++iter) {
+        double t2 = theta * theta;
+        double t4 = t2 * t2;
+        double t6 = t4 * t2;
+        double t8 = t4 * t4;
+        double poly = 1.0 +
+                      model->fish_k[0] * t2 +
+                      model->fish_k[1] * t4 +
+                      model->fish_k[2] * t6 +
+                      model->fish_k[3] * t8;
+        double f = theta * poly - theta_d;
+        double dpoly = 1.0 +
+                       3.0 * model->fish_k[0] * t2 +
+                       5.0 * model->fish_k[1] * t4 +
+                       7.0 * model->fish_k[2] * t6 +
+                       9.0 * model->fish_k[3] * t8;
+
+        if (fabs(dpoly) < 1e-12) {
+            break;
+        }
+        theta -= f / dpoly;
+    }
+
+    if (fabs(theta) > (M_PI * 0.495)) {
+        return -1;
+    }
+
+    {
+        double r = tan(theta);
+        double scale = r / rd;
+        double xu = xd * scale;
+        double yu = yd * scale;
+
+        undistorted->x = xu * model->fish_fx_new + model->fish_cx_new;
+        undistorted->y = yu * model->fish_fy_new + model->fish_cy_new;
+    }
+    if (undistorted->x < -(double)FISHEYE_CALIB_WIDTH * 4.0 ||
+        undistorted->x >  (double)FISHEYE_CALIB_WIDTH * 4.0 ||
+        undistorted->y < -(double)FISHEYE_CALIB_HEIGHT * 4.0 ||
+        undistorted->y >  (double)FISHEYE_CALIB_HEIGHT * 4.0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int distort_point_with_fisheye(const rectification_model_t *model,
+                                      const pointf_t *undistorted,
+                                      pointf_t *distorted)
+{
+    double xu = (undistorted->x - model->fish_cx_new) / model->fish_fx_new;
+    double yu = (undistorted->y - model->fish_cy_new) / model->fish_fy_new;
+    double r = sqrt(xu * xu + yu * yu);
+    double xd;
+    double yd;
+
+    if (r < 1e-12) {
+        distorted->x = model->fish_cx;
+        distorted->y = model->fish_cy;
+        return 0;
+    }
+
+    {
+        double theta = atan(r);
+        double t2 = theta * theta;
+        double t4 = t2 * t2;
+        double t6 = t4 * t2;
+        double t8 = t4 * t4;
+        double theta_d = theta * (1.0 +
+                                  model->fish_k[0] * t2 +
+                                  model->fish_k[1] * t4 +
+                                  model->fish_k[2] * t6 +
+                                  model->fish_k[3] * t8);
+        double scale = theta_d / r;
+
+        xd = xu * scale;
+        yd = yu * scale;
+    }
+
+    distorted->x = xd * model->fish_fx + model->fish_cx;
+    distorted->y = yd * model->fish_fy + model->fish_cy;
+    return 0;
+}
+
+static int undistort_point(const rectification_model_t *model,
+                           const pointf_t *distorted,
+                           pointf_t *undistorted)
+{
+    if (model->use_fisheye) {
+        return undistort_point_with_fisheye(model, distorted, undistorted);
+    }
+    return undistort_point_with_k1(distorted,
+                                   model->cx,
+                                   model->cy,
+                                   model->scale,
+                                   model->k1,
+                                   undistorted);
+}
+
+static int distort_point(const rectification_model_t *model,
+                         const pointf_t *undistorted,
+                         pointf_t *distorted)
+{
+    if (model->use_fisheye) {
+        return distort_point_with_fisheye(model, undistorted, distorted);
+    }
+    return distort_point_with_k1(model, undistorted, distorted);
+}
+
+static int invert_3x3_matrix(const double m[9], double inv_out[9])
+{
+    double det = m[0] * (m[4] * m[8] - m[5] * m[7]) -
+                 m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                 m[2] * (m[3] * m[7] - m[4] * m[6]);
+
+    if (fabs(det) < 1e-9) {
+        return -1;
+    }
+
+    inv_out[0] = (m[4] * m[8] - m[5] * m[7]) / det;
+    inv_out[1] = (m[2] * m[7] - m[1] * m[8]) / det;
+    inv_out[2] = (m[1] * m[5] - m[2] * m[4]) / det;
+    inv_out[3] = (m[5] * m[6] - m[3] * m[8]) / det;
+    inv_out[4] = (m[0] * m[8] - m[2] * m[6]) / det;
+    inv_out[5] = (m[2] * m[3] - m[0] * m[5]) / det;
+    inv_out[6] = (m[3] * m[7] - m[4] * m[6]) / det;
+    inv_out[7] = (m[1] * m[6] - m[0] * m[7]) / det;
+    inv_out[8] = (m[0] * m[4] - m[1] * m[3]) / det;
+    return 0;
+}
+
+static int solve_homography_from_quads(const pointf_t src[4], const pointf_t dst[4], double h_out[9])
+{
+    double a[8][9];
+    int row;
+    int col;
+    int pivot;
+
+    memset(a, 0, sizeof(a));
+    for (row = 0; row < 4; ++row) {
+        double x = src[row].x;
+        double y = src[row].y;
+        double u = dst[row].x;
+        double v = dst[row].y;
+
+        a[row * 2][0] = x;
+        a[row * 2][1] = y;
+        a[row * 2][2] = 1.0;
+        a[row * 2][6] = -u * x;
+        a[row * 2][7] = -u * y;
+        a[row * 2][8] = u;
+
+        a[row * 2 + 1][3] = x;
+        a[row * 2 + 1][4] = y;
+        a[row * 2 + 1][5] = 1.0;
+        a[row * 2 + 1][6] = -v * x;
+        a[row * 2 + 1][7] = -v * y;
+        a[row * 2 + 1][8] = v;
+    }
+
+    for (col = 0; col < 8; ++col) {
+        int best_row = col;
+        double best_abs = fabs(a[col][col]);
+
+        for (pivot = col + 1; pivot < 8; ++pivot) {
+            double cur_abs = fabs(a[pivot][col]);
+
+            if (cur_abs > best_abs) {
+                best_abs = cur_abs;
+                best_row = pivot;
+            }
+        }
+
+        if (best_abs < 1e-9) {
+            return -1;
+        }
+
+        if (best_row != col) {
+            double tmp_row[9];
+
+            memcpy(tmp_row, a[col], sizeof(tmp_row));
+            memcpy(a[col], a[best_row], sizeof(tmp_row));
+            memcpy(a[best_row], tmp_row, sizeof(tmp_row));
+        }
+
+        {
+            double diag = a[col][col];
+
+            for (pivot = col; pivot < 9; ++pivot) {
+                a[col][pivot] /= diag;
+            }
+        }
+
+        for (row = 0; row < 8; ++row) {
+            double factor;
+
+            if (row == col) {
+                continue;
+            }
+            factor = a[row][col];
+            if (fabs(factor) < 1e-12) {
+                continue;
+            }
+
+            for (pivot = col; pivot < 9; ++pivot) {
+                a[row][pivot] -= factor * a[col][pivot];
+            }
+        }
+    }
+
+    h_out[0] = a[0][8];
+    h_out[1] = a[1][8];
+    h_out[2] = a[2][8];
+    h_out[3] = a[3][8];
+    h_out[4] = a[4][8];
+    h_out[5] = a[5][8];
+    h_out[6] = a[6][8];
+    h_out[7] = a[7][8];
+    h_out[8] = 1.0;
+    return 0;
+}
+
+static int apply_homography(const double h[9], double x, double y, pointf_t *out)
+{
+    double denom = h[6] * x + h[7] * y + h[8];
+
+    if (fabs(denom) < 1e-9) {
+        return -1;
+    }
+
+    out->x = (h[0] * x + h[1] * y + h[2]) / denom;
+    out->y = (h[3] * x + h[4] * y + h[5]) / denom;
+    return 0;
+}
+
+static void multiply_3x3_matrix(const double a[9], const double b[9], double out[9])
+{
+    double r[9];
+
+    r[0] = a[0] * b[0] + a[1] * b[3] + a[2] * b[6];
+    r[1] = a[0] * b[1] + a[1] * b[4] + a[2] * b[7];
+    r[2] = a[0] * b[2] + a[1] * b[5] + a[2] * b[8];
+
+    r[3] = a[3] * b[0] + a[4] * b[3] + a[5] * b[6];
+    r[4] = a[3] * b[1] + a[4] * b[4] + a[5] * b[7];
+    r[5] = a[3] * b[2] + a[4] * b[5] + a[5] * b[8];
+
+    r[6] = a[6] * b[0] + a[7] * b[3] + a[8] * b[6];
+    r[7] = a[6] * b[1] + a[7] * b[4] + a[8] * b[7];
+    r[8] = a[6] * b[2] + a[7] * b[5] + a[8] * b[8];
+
+    memcpy(out, r, sizeof(r));
 }
 
 static void scaled_calibration_points(const t23_border_calibration_t *cal,
@@ -306,10 +858,8 @@ static void scaled_calibration_points(const t23_border_calibration_t *cal,
 
 static void compute_rectified_size(const pointf_t pts[T23_BORDER_POINT_COUNT], int *out_w, int *out_h)
 {
-    double top_len = pointf_distance(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_TML]) +
-                     pointf_distance(pts[T23_BORDER_POINT_TML], pts[T23_BORDER_POINT_TM]) +
-                     pointf_distance(pts[T23_BORDER_POINT_TM], pts[T23_BORDER_POINT_TMR]) +
-                     pointf_distance(pts[T23_BORDER_POINT_TMR], pts[T23_BORDER_POINT_TR]);
+    double top_len = pointf_distance(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_TM]) +
+                     pointf_distance(pts[T23_BORDER_POINT_TM], pts[T23_BORDER_POINT_TR]);
     double bottom_len = pointf_distance(pts[T23_BORDER_POINT_BL], pts[T23_BORDER_POINT_BM]) +
                         pointf_distance(pts[T23_BORDER_POINT_BM], pts[T23_BORDER_POINT_BR]);
     double left_len = pointf_distance(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_LM]) +
@@ -336,76 +886,614 @@ static void compute_rectified_size(const pointf_t pts[T23_BORDER_POINT_COUNT], i
     *out_h = height;
 }
 
-static void compute_calibration_bbox(const pointf_t pts[T23_BORDER_POINT_COUNT],
-                                     int src_w,
-                                     int src_h,
-                                     int *left_out,
-                                     int *top_out,
-                                     int *right_out,
-                                     int *bottom_out)
+static void compute_rectified_size_from_quad(const pointf_t quad[4], int *out_w, int *out_h)
 {
-    double min_x = pts[0].x;
-    double max_x = pts[0].x;
-    double min_y = pts[0].y;
-    double max_y = pts[0].y;
+    double top_len = pointf_distance(quad[0], quad[1]);
+    double right_len = pointf_distance(quad[1], quad[2]);
+    double bottom_len = pointf_distance(quad[2], quad[3]);
+    double left_len = pointf_distance(quad[3], quad[0]);
+    double width_est = (top_len > bottom_len) ? top_len : bottom_len;
+    double height_est = (left_len > right_len) ? left_len : right_len;
+    int width = (int)lrint(width_est);
+    int height = (int)lrint(height_est);
+
+    width = clamp_int(width, 320, RECTIFIED_MAX_WIDTH);
+    height = (int)lrint((double)width * 9.0 / 16.0);
+
+    if (height > RECTIFIED_MAX_HEIGHT || (double)height < height_est) {
+        height = clamp_int((int)lrint(height_est), 180, RECTIFIED_MAX_HEIGHT);
+        width = (int)lrint((double)height * 16.0 / 9.0);
+        if (width > RECTIFIED_MAX_WIDTH) {
+            width = RECTIFIED_MAX_WIDTH;
+            height = (int)lrint((double)width * 9.0 / 16.0);
+        }
+    }
+
+    width = clamp_int(width, 320, RECTIFIED_MAX_WIDTH);
+    height = clamp_int(height, 180, RECTIFIED_MAX_HEIGHT);
+
+    *out_w = width;
+    *out_h = height;
+}
+
+static int finalize_rectification_model_with_k1(rectification_model_t *model)
+{
+    static const unsigned int bottom_idx[] = {
+        T23_BORDER_POINT_BR,
+        T23_BORDER_POINT_BM,
+        T23_BORDER_POINT_BL
+    };
+    int point_valid[T23_BORDER_POINT_COUNT];
+    pointf_t edge_pts[3];
+    pointf_t left_pts[2];
+    pointf_t right_pts[2];
+    line2d_t top_line;
+    line2d_t right_line;
+    line2d_t bottom_line;
+    line2d_t left_line;
+    pointf_t fitted_quad[4];
+    pointf_t expanded_quad[4];
+    pointf_t dst_quad[4];
+    pointf_t tl_pred;
+    pointf_t tr_pred;
+    pointf_t tl_ref;
+    pointf_t tr_ref;
     unsigned int i;
 
-    for (i = 1; i < T23_BORDER_POINT_COUNT; ++i) {
-        if (pts[i].x < min_x) {
-            min_x = pts[i].x;
+    memset(point_valid, 0, sizeof(point_valid));
+    for (i = 0; i < T23_BORDER_POINT_COUNT; ++i) {
+        if (undistort_point(model,
+                            &model->pts_distorted[i],
+                            &model->pts_undistorted[i]) < 0) {
+            /*
+             * Python keeps the fixed-fisheye path alive even when TL/TR sit so
+             * close to the fisheye edge that OpenCV marks them invalid.
+             * Those two points are only weak references for the top line, so do
+             * not let them knock the whole model back to the conservative
+             * fallback path.
+             */
+            if (i == T23_BORDER_POINT_TL || i == T23_BORDER_POINT_TR) {
+                model->pts_undistorted[i].x = -1000000.0;
+                model->pts_undistorted[i].y = -1000000.0;
+                continue;
+            }
+            return -1;
         }
-        if (pts[i].x > max_x) {
-            max_x = pts[i].x;
+        point_valid[i] = 1;
+    }
+
+    for (i = 0; i < 3u; ++i) {
+        edge_pts[i] = model->pts_undistorted[bottom_idx[i]];
+    }
+    if (fit_line_tls(edge_pts, 3u, &bottom_line) < 0) {
+        return -1;
+    }
+
+    left_pts[0] = model->pts_undistorted[T23_BORDER_POINT_BL];
+    left_pts[1] = model->pts_undistorted[T23_BORDER_POINT_LM];
+    right_pts[0] = model->pts_undistorted[T23_BORDER_POINT_BR];
+    right_pts[1] = model->pts_undistorted[T23_BORDER_POINT_RM];
+
+    if (fit_line_tls(left_pts, 2u, &left_line) < 0 ||
+        fit_line_tls(right_pts, 2u, &right_line) < 0) {
+        return -1;
+    }
+
+    /*
+     * TL/TR are the noisiest points because they sit near the fisheye edge.
+     * Use BL/LM and BR/RM as the primary side constraints, extrapolate a
+     * predicted top pair, then only blend a small amount of the dragged TL/TR
+     * back in as a weak reference.
+     */
+    tl_pred.x = 2.0 * model->pts_undistorted[T23_BORDER_POINT_LM].x -
+                model->pts_undistorted[T23_BORDER_POINT_BL].x;
+    tl_pred.y = 2.0 * model->pts_undistorted[T23_BORDER_POINT_LM].y -
+                model->pts_undistorted[T23_BORDER_POINT_BL].y;
+    tr_pred.x = 2.0 * model->pts_undistorted[T23_BORDER_POINT_RM].x -
+                model->pts_undistorted[T23_BORDER_POINT_BR].x;
+    tr_pred.y = 2.0 * model->pts_undistorted[T23_BORDER_POINT_RM].y -
+                model->pts_undistorted[T23_BORDER_POINT_BR].y;
+
+    /*
+     * Match Python literally here: TL/TR are always mixed into the top-line
+     * reference, even when OpenCV marked them invalid near the fisheye edge.
+     * That pushes the fitted top edge much farther away, which is exactly the
+     * current Python behavior the web preview is being compared against.
+     */
+    tl_ref.x = tl_pred.x * (1.0 - TOP_CORNER_USER_BLEND) +
+               model->pts_undistorted[T23_BORDER_POINT_TL].x * TOP_CORNER_USER_BLEND;
+    tl_ref.y = tl_pred.y * (1.0 - TOP_CORNER_USER_BLEND) +
+               model->pts_undistorted[T23_BORDER_POINT_TL].y * TOP_CORNER_USER_BLEND;
+    tr_ref.x = tr_pred.x * (1.0 - TOP_CORNER_USER_BLEND) +
+               model->pts_undistorted[T23_BORDER_POINT_TR].x * TOP_CORNER_USER_BLEND;
+    tr_ref.y = tr_pred.y * (1.0 - TOP_CORNER_USER_BLEND) +
+               model->pts_undistorted[T23_BORDER_POINT_TR].y * TOP_CORNER_USER_BLEND;
+
+    edge_pts[0] = tl_ref;
+    edge_pts[1] = tr_ref;
+    if (fit_line_tls(edge_pts, 2u, &top_line) < 0) {
+        return -1;
+    }
+
+    if (intersect_lines(&top_line, &left_line, &fitted_quad[0]) < 0 ||
+        intersect_lines(&top_line, &right_line, &fitted_quad[1]) < 0 ||
+        intersect_lines(&bottom_line, &right_line, &fitted_quad[2]) < 0 ||
+        intersect_lines(&bottom_line, &left_line, &fitted_quad[3]) < 0) {
+        return -1;
+    }
+
+    memcpy(model->pts_expanded, model->pts_undistorted, sizeof(model->pts_expanded));
+
+    expanded_quad[0] = fitted_quad[0];
+    expanded_quad[1] = fitted_quad[1];
+    expanded_quad[2] = fitted_quad[2];
+    expanded_quad[3] = fitted_quad[3];
+
+    compute_rectified_size_from_quad(expanded_quad, &model->rectified_width, &model->rectified_height);
+    dst_quad[0].x = 0.0;
+    dst_quad[0].y = 0.0;
+    dst_quad[1].x = (double)(model->rectified_width - 1);
+    dst_quad[1].y = 0.0;
+    dst_quad[2].x = (double)(model->rectified_width - 1);
+    dst_quad[2].y = (double)(model->rectified_height - 1);
+    dst_quad[3].x = 0.0;
+    dst_quad[3].y = (double)(model->rectified_height - 1);
+
+    if (solve_homography_from_quads(expanded_quad, dst_quad, model->homography) < 0) {
+        return -1;
+    }
+    if (invert_3x3_matrix(model->homography, model->homography_inv) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int build_rectification_model(const t23_border_calibration_t *cal,
+                                     int src_w,
+                                     int src_h,
+                                     rectification_model_t *model)
+{
+    pointf_t tm_rect;
+
+    memset(model, 0, sizeof(*model));
+    scaled_calibration_points(cal, src_w, src_h, model->pts_distorted);
+    model->cx = (double)(src_w - 1) * 0.5;
+    model->cy = (double)(src_h - 1) * 0.5;
+    model->scale = ((src_w > src_h) ? (double)src_w : (double)src_h) * 0.5;
+    if (model->scale < 1.0) {
+        model->scale = 1.0;
+    }
+    /* Use the fixed offline fisheye calibration as the only primary path. */
+    if (init_fixed_fisheye_profile(model, src_w, src_h) == 0 &&
+        finalize_rectification_model_with_k1(model) == 0) {
+        if (apply_homography(model->homography,
+                             model->pts_undistorted[T23_BORDER_POINT_TM].x,
+                             model->pts_undistorted[T23_BORDER_POINT_TM].y,
+                             &tm_rect) == 0) {
+            model->tm_rect_y = tm_rect.y;
+        } else {
+            model->tm_rect_y = 0.0;
         }
-        if (pts[i].y < min_y) {
-            min_y = pts[i].y;
-        }
-        if (pts[i].y > max_y) {
-            max_y = pts[i].y;
+        if (finalize_rectification_crop(model, src_w, src_h) == 0) {
+            return 0;
         }
     }
 
-    *left_out = clamp_int((int)floor(min_x), 0, src_w - 1);
-    *top_out = clamp_int((int)floor(min_y), 0, src_h - 1);
-    *right_out = clamp_int((int)ceil(max_x), 0, src_w - 1);
-    *bottom_out = clamp_int((int)ceil(max_y), 0, src_h - 1);
-
-    if (*right_out <= *left_out) {
-        *right_out = clamp_int(*left_out + 1, 1, src_w - 1);
+    /*
+     * Keep one conservative fallback only: disable lens undistortion and use
+     * the 8-point perspective model directly. Do not re-introduce any dynamic
+     * k1 fitting here, otherwise TM and other helper points start influencing
+     * the lens model again.
+     */
+    memset(model, 0, sizeof(*model));
+    scaled_calibration_points(cal, src_w, src_h, model->pts_distorted);
+    model->cx = (double)(src_w - 1) * 0.5;
+    model->cy = (double)(src_h - 1) * 0.5;
+    model->scale = ((src_w > src_h) ? (double)src_w : (double)src_h) * 0.5;
+    if (model->scale < 1.0) {
+        model->scale = 1.0;
     }
-    if (*bottom_out <= *top_out) {
-        *bottom_out = clamp_int(*top_out + 1, 1, src_h - 1);
+    model->k1 = 0.0;
+    if (finalize_rectification_model_with_k1(model) == 0) {
+        if (apply_homography(model->homography,
+                             model->pts_undistorted[T23_BORDER_POINT_TM].x,
+                             model->pts_undistorted[T23_BORDER_POINT_TM].y,
+                             &tm_rect) == 0) {
+            model->tm_rect_y = tm_rect.y;
+        } else {
+            model->tm_rect_y = 0.0;
+        }
+        if (finalize_rectification_crop(model, src_w, src_h) == 0) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int build_rectification_model_raw(const t23_border_calibration_t *cal,
+                                         int src_w,
+                                         int src_h,
+                                         rectification_model_t *model)
+{
+    pointf_t tm_rect;
+
+    memset(model, 0, sizeof(*model));
+    scaled_calibration_points(cal, src_w, src_h, model->pts_distorted);
+    model->cx = (double)(src_w - 1) * 0.5;
+    model->cy = (double)(src_h - 1) * 0.5;
+    model->scale = ((src_w > src_h) ? (double)src_w : (double)src_h) * 0.5;
+    if (model->scale < 1.0) {
+        model->scale = 1.0;
+    }
+    model->k1 = 0.0;
+    if (finalize_rectification_model_with_k1(model) < 0) {
+        return -1;
+    }
+    if (apply_homography(model->homography,
+                         model->pts_undistorted[T23_BORDER_POINT_TM].x,
+                         model->pts_undistorted[T23_BORDER_POINT_TM].y,
+                         &tm_rect) == 0) {
+        model->tm_rect_y = tm_rect.y;
+    } else {
+        model->tm_rect_y = 0.0;
+    }
+    return finalize_rectification_crop(model, src_w, src_h);
+}
+
+static int build_rectification_model_fisheye(const t23_border_calibration_t *cal,
+                                             int src_w,
+                                             int src_h,
+                                             rectification_model_t *model)
+{
+    pointf_t tm_rect;
+
+    memset(model, 0, sizeof(*model));
+    scaled_calibration_points(cal, src_w, src_h, model->pts_distorted);
+    model->cx = (double)(src_w - 1) * 0.5;
+    model->cy = (double)(src_h - 1) * 0.5;
+    model->scale = ((src_w > src_h) ? (double)src_w : (double)src_h) * 0.5;
+    if (model->scale < 1.0) {
+        model->scale = 1.0;
+    }
+    if (init_fixed_fisheye_profile(model, src_w, src_h) < 0) {
+        return -1;
+    }
+    if (finalize_rectification_model_with_k1(model) < 0) {
+        return -1;
+    }
+    if (apply_homography(model->homography,
+                         model->pts_undistorted[T23_BORDER_POINT_TM].x,
+                         model->pts_undistorted[T23_BORDER_POINT_TM].y,
+                         &tm_rect) == 0) {
+        model->tm_rect_y = tm_rect.y;
+    } else {
+        model->tm_rect_y = 0.0;
+    }
+    return finalize_rectification_crop(model, src_w, src_h);
+}
+
+static int rectified_point_to_source(const rectification_model_t *model,
+                                     double x,
+                                     double y,
+                                     pointf_t *src_out)
+{
+    pointf_t undistorted;
+    if (apply_homography(model->homography_inv, x, y, &undistorted) < 0) {
+        return -1;
+    }
+    return distort_point(model, &undistorted, src_out);
+}
+
+static int rectified_uv_to_source(const rectification_model_t *model,
+                                  double u,
+                                  double v,
+                                  pointf_t *src_out)
+{
+    double x = u * (double)(model->rectified_width - 1);
+    double y = v * (double)(model->rectified_height - 1);
+
+    return rectified_point_to_source(model, x, y, src_out);
+}
+
+static int rectified_crop_point_to_source(const rectification_model_t *model,
+                                          double x,
+                                          double y,
+                                          pointf_t *src_out)
+{
+    return rectified_point_to_source(model,
+                                     x + (double)model->crop_left,
+                                     y + (double)model->crop_top,
+                                     src_out);
+}
+
+static int build_direct_valid_mask(const rectification_model_t *model,
+                                   int src_w,
+                                   int src_h,
+                                   uint8_t *valid_mask)
+{
+    int x;
+    int y;
+
+    for (y = 0; y < model->rectified_height; ++y) {
+        for (x = 0; x < model->rectified_width; ++x) {
+            pointf_t src;
+            uint8_t ok = 0;
+
+            if (rectified_point_to_source(model, (double)x, (double)y, &src) == 0 &&
+                src.x >= 0.0 && src.x < (double)src_w &&
+                src.y >= 0.0 && src.y < (double)src_h) {
+                ok = 1;
+            }
+            valid_mask[y * model->rectified_width + x] = ok;
+        }
+    }
+
+    return 0;
+}
+
+static void build_invalid_integral_image(const uint8_t *valid_mask,
+                                         int mask_w,
+                                         int mask_h,
+                                         uint32_t *integral)
+{
+    int x;
+    int y;
+    int stride = mask_w + 1;
+
+    memset(integral, 0, (size_t)stride * (size_t)(mask_h + 1) * sizeof(*integral));
+    for (y = 0; y < mask_h; ++y) {
+        uint32_t row_sum = 0;
+        for (x = 0; x < mask_w; ++x) {
+            row_sum += (valid_mask[y * mask_w + x] == 0) ? 1u : 0u;
+            integral[(y + 1) * stride + (x + 1)] = integral[y * stride + (x + 1)] + row_sum;
+        }
     }
 }
 
-static pointf_t coons_patch_point(const pointf_t pts[T23_BORDER_POINT_COUNT], double u, double v)
+static uint32_t count_invalid_pixels(const uint32_t *integral,
+                                     int stride,
+                                     int x,
+                                     int y,
+                                     int w,
+                                     int h)
 {
-    pointf_t top = pointf_bezier4(pts[T23_BORDER_POINT_TL],
-                                  pts[T23_BORDER_POINT_TML],
-                                  pts[T23_BORDER_POINT_TM],
-                                  pts[T23_BORDER_POINT_TMR],
-                                  pts[T23_BORDER_POINT_TR],
-                                  u);
-    pointf_t bottom = pointf_bezier2(pts[T23_BORDER_POINT_BL], pts[T23_BORDER_POINT_BM], pts[T23_BORDER_POINT_BR], u);
-    pointf_t left = pointf_bezier2(pts[T23_BORDER_POINT_TL], pts[T23_BORDER_POINT_LM], pts[T23_BORDER_POINT_BL], v);
-    pointf_t right = pointf_bezier2(pts[T23_BORDER_POINT_TR], pts[T23_BORDER_POINT_RM], pts[T23_BORDER_POINT_BR], v);
-    pointf_t bilinear;
-    pointf_t out;
-    double omt_u = 1.0 - u;
-    double omt_v = 1.0 - v;
+    int x2 = x + w;
+    int y2 = y + h;
+    return integral[y2 * stride + x2] - integral[y * stride + x2] -
+           integral[y2 * stride + x] + integral[y * stride + x];
+}
 
-    bilinear.x = omt_u * omt_v * pts[T23_BORDER_POINT_TL].x +
-                 u * omt_v * pts[T23_BORDER_POINT_TR].x +
-                 omt_u * v * pts[T23_BORDER_POINT_BL].x +
-                 u * v * pts[T23_BORDER_POINT_BR].x;
-    bilinear.y = omt_u * omt_v * pts[T23_BORDER_POINT_TL].y +
-                 u * omt_v * pts[T23_BORDER_POINT_TR].y +
-                 omt_u * v * pts[T23_BORDER_POINT_BL].y +
-                 u * v * pts[T23_BORDER_POINT_BR].y;
+static double score_centered_crop(const uint32_t *invalid_integral,
+                                  int integral_stride,
+                                  int x,
+                                  int y,
+                                  int w,
+                                  int h,
+                                  double desired_cx,
+                                  double desired_cy,
+                                  double *ratio_out)
+{
+    int total = w * h;
+    uint32_t invalid;
+    double crop_cx;
+    double crop_cy;
+    double dist2;
 
-    out.x = omt_u * left.x + u * right.x + omt_v * top.x + v * bottom.x - bilinear.x;
-    out.y = omt_u * left.y + u * right.y + omt_v * top.y + v * bottom.y - bilinear.y;
-    return out;
+    if (w <= 0 || h <= 0 || total <= 0) {
+        *ratio_out = 0.0;
+        return -1e18;
+    }
+
+    invalid = count_invalid_pixels(invalid_integral, integral_stride, x, y, w, h);
+    *ratio_out = (double)(total - (int)invalid) / (double)total;
+    crop_cx = (double)x + (double)w * 0.5;
+    crop_cy = (double)y + (double)h * 0.5;
+    dist2 = (crop_cx - desired_cx) * (crop_cx - desired_cx) +
+            (crop_cy - desired_cy) * (crop_cy - desired_cy);
+    return (double)total + (*ratio_out) * 1000000.0 - dist2 * 4.0;
+}
+
+static void find_centered_16x9_crop(const uint8_t *valid_mask,
+                                    const uint32_t *invalid_integral,
+                                    int mask_w,
+                                    int mask_h,
+                                    double desired_cx,
+                                    double desired_cy,
+                                    int min_top,
+                                    double min_valid_ratio,
+                                    int *crop_x_out,
+                                    int *crop_y_out,
+                                    int *crop_w_out,
+                                    int *crop_h_out,
+                                    double *ratio_out)
+{
+    int best_x = 0;
+    int best_y = 0;
+    int best_w = mask_w;
+    int best_h = mask_h;
+    double best_ratio = 0.0;
+    double best_score = -1e18;
+    int found_good = 0;
+    int ch;
+
+    (void)valid_mask;
+    int integral_stride = mask_w + 1;
+
+    min_top = clamp_int(min_top, 0, mask_h - 1);
+    for (ch = mask_h - min_top; ch > 179; ch -= 4) {
+        int cw = (int)lrint((double)ch * 16.0 / 9.0);
+        int x0;
+        int y0;
+        int search_dx;
+        int search_dy;
+        int step_x;
+        int step_y;
+        int dx;
+        int dy;
+        double local_best_score = -1e18;
+        int local_found = 0;
+        int local_x = 0;
+        int local_y = 0;
+        double local_ratio = 0.0;
+
+        if (cw > mask_w) {
+            continue;
+        }
+
+        x0 = clamp_int((int)lrint(desired_cx - (double)cw * 0.5), 0, mask_w - cw);
+        y0 = clamp_int((int)lrint(desired_cy - (double)ch * 0.5), min_top, mask_h - ch);
+
+        search_dx = clamp_int(cw / 40, 8, 40);
+        search_dy = clamp_int(ch / 40, 6, 30);
+        if (min_top > 0) {
+            /*
+             * When crop top is constrained by TM headroom, the best fully valid
+             * 16:9 crop may sit noticeably lower than the centered guess.
+             * Search the full feasible vertical span so we do not shrink the
+             * crop prematurely and cut off the lower content.
+             */
+            search_dy = mask_h - ch - min_top;
+            if (search_dy < 0) {
+                search_dy = 0;
+            }
+        }
+        step_x = clamp_int(search_dx / 5, 2, 1000);
+        step_y = (min_top > 0) ? 2 : clamp_int(search_dy / 5, 2, 1000);
+
+        for (dy = -search_dy; dy <= search_dy; dy += step_y) {
+            for (dx = -search_dx; dx <= search_dx; dx += step_x) {
+                int x = clamp_int(x0 + dx, 0, mask_w - cw);
+                int y = clamp_int(y0 + dy, min_top, mask_h - ch);
+                double ratio = 0.0;
+                double score = score_centered_crop(invalid_integral,
+                                                   integral_stride,
+                                                   x,
+                                                   y,
+                                                   cw,
+                                                   ch,
+                                                   desired_cx,
+                                                   desired_cy,
+                                                   &ratio);
+
+                if (score > local_best_score) {
+                    local_best_score = score;
+                    local_x = x;
+                    local_y = y;
+                    local_ratio = ratio;
+                    local_found = 1;
+                }
+            }
+        }
+
+        if (!local_found) {
+            continue;
+        }
+
+        if (local_ratio >= min_valid_ratio) {
+            if (!found_good || local_best_score > best_score) {
+                best_score = local_best_score;
+                best_x = local_x;
+                best_y = local_y;
+                best_w = cw;
+                best_h = ch;
+                best_ratio = local_ratio;
+                found_good = 1;
+            }
+            break;
+        }
+
+        if (!found_good && local_best_score > best_score) {
+            best_score = local_best_score;
+            best_x = local_x;
+            best_y = local_y;
+            best_w = cw;
+            best_h = ch;
+            best_ratio = local_ratio;
+        }
+    }
+
+    *crop_x_out = best_x;
+    *crop_y_out = best_y;
+    *crop_w_out = best_w;
+    *crop_h_out = best_h;
+    *ratio_out = best_ratio;
+}
+
+static int finalize_rectification_crop(rectification_model_t *model, int src_w, int src_h)
+{
+    uint8_t *valid_mask = NULL;
+    uint32_t *invalid_integral = NULL;
+    double desired_cx = (double)model->rectified_width * 0.5;
+    double desired_cy = (double)model->rectified_height * 0.5;
+    int safe_top;
+
+    valid_mask = malloc((size_t)model->rectified_width * (size_t)model->rectified_height);
+    if (valid_mask == NULL) {
+        return -1;
+    }
+    invalid_integral = malloc((size_t)(model->rectified_width + 1) *
+                              (size_t)(model->rectified_height + 1) *
+                              sizeof(*invalid_integral));
+    if (invalid_integral == NULL) {
+        free(valid_mask);
+        return -1;
+    }
+
+    safe_top = clamp_int((int)floor(model->tm_rect_y - 10.0), 0, model->rectified_height - 1);
+
+    build_direct_valid_mask(model, src_w, src_h, valid_mask);
+    build_invalid_integral_image(valid_mask,
+                                 model->rectified_width,
+                                 model->rectified_height,
+                                 invalid_integral);
+    find_centered_16x9_crop(valid_mask,
+                            invalid_integral,
+                            model->rectified_width,
+                            model->rectified_height,
+                            desired_cx,
+                            desired_cy,
+                            safe_top,
+                            1.0,
+                            &model->crop_left,
+                            &model->crop_top,
+                            &model->crop_width,
+                            &model->crop_height,
+                            &model->crop_valid_ratio);
+
+    free(invalid_integral);
+    free(valid_mask);
+    return 0;
+}
+
+static int rectified_uv_to_source_blended(const rectification_model_t *raw_model,
+                                          const rectification_model_t *fish_model,
+                                          double blend,
+                                          double u,
+                                          double v,
+                                          pointf_t *src_out)
+{
+    pointf_t raw_src;
+    pointf_t fish_src;
+    int raw_ok = rectified_uv_to_source(raw_model, u, v, &raw_src) == 0;
+    int fish_ok = (fish_model != NULL) && rectified_uv_to_source(fish_model, u, v, &fish_src) == 0;
+
+    if (!raw_ok && !fish_ok) {
+        return -1;
+    }
+    if (raw_ok && !fish_ok) {
+        *src_out = raw_src;
+        return 0;
+    }
+    if (!raw_ok && fish_ok) {
+        *src_out = fish_src;
+        return 0;
+    }
+
+    src_out->x = raw_src.x * (1.0 - blend) + fish_src.x * blend;
+    src_out->y = raw_src.y * (1.0 - blend) + fish_src.y * blend;
+    return 0;
 }
 
 static unsigned char bilinear_sample_channel(const unsigned char *rgb,
@@ -559,11 +1647,9 @@ static int build_rectified_rgb_from_calibration(const unsigned char *src_jpeg,
 {
     unsigned char *src_rgb = NULL;
     unsigned char *dst_rgb = NULL;
-    pointf_t pts[T23_BORDER_POINT_COUNT];
+    rectification_model_t model;
     int src_w = 0;
     int src_h = 0;
-    int dst_w = 0;
-    int dst_h = 0;
     int rect_left = 0;
     int rect_top = 0;
     int rect_right = 0;
@@ -583,39 +1669,43 @@ static int build_rectified_rgb_from_calibration(const unsigned char *src_jpeg,
         return -1;
     }
 
-    scaled_calibration_points(&g_calibration, src_w, src_h, pts);
-    compute_rectified_size(pts, &dst_w, &dst_h);
-    dst_rgb = malloc((size_t)dst_w * dst_h * 3);
+    if (build_rectification_model(&g_calibration, src_w, src_h, &model) < 0) {
+        free(src_rgb);
+        return -1;
+    }
+
+    dst_rgb = malloc((size_t)model.crop_width * model.crop_height * 3);
     if (dst_rgb == NULL) {
         free(src_rgb);
         return -1;
     }
     rect_left = 0;
     rect_top = 0;
-    rect_right = dst_w - 1;
-    rect_bottom = dst_h - 1;
+    rect_right = model.crop_width - 1;
+    rect_bottom = model.crop_height - 1;
 
-    for (y = 0; y < dst_h; ++y) {
-        for (x = 0; x < dst_w; ++x) {
-            double u;
-            double v;
+    for (y = 0; y < model.crop_height; ++y) {
+        for (x = 0; x < model.crop_width; ++x) {
             pointf_t src;
-            unsigned char *pixel = dst_rgb + (y * dst_w + x) * 3;
-
-            u = (dst_w > 1) ? (double)x / (double)(dst_w - 1) : 0.0;
-            v = (dst_h > 1) ? (double)y / (double)(dst_h - 1) : 0.0;
-            src = coons_patch_point(pts, u, v);
+            unsigned char *pixel = dst_rgb + (y * model.crop_width + x) * 3;
+            if (rectified_crop_point_to_source(&model, (double)x, (double)y, &src) < 0 ||
+                src.x < 0.0 || src.x > (double)(src_w - 1) ||
+                src.y < 0.0 || src.y > (double)(src_h - 1)) {
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
+                continue;
+            }
 
             pixel[0] = bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 0);
             pixel[1] = bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 1);
             pixel[2] = bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 2);
         }
     }
-
     free(src_rgb);
     *dst_rgb_out = dst_rgb;
-    *dst_w_out = dst_w;
-    *dst_h_out = dst_h;
+    *dst_w_out = model.crop_width;
+    *dst_h_out = model.crop_height;
     *rect_left_out = rect_left;
     *rect_top_out = rect_top;
     *rect_right_out = rect_right;
@@ -670,62 +1760,10 @@ static int rectify_jpeg_from_calibration(const unsigned char *src_jpeg,
     return 0;
 }
 
-static void compute_average_rect(const unsigned char *rgb,
-                                 int width,
-                                 int height,
-                                 int left,
-                                 int top,
-                                 int right,
-                                 int bottom,
-                                 t23_rgb8_t *out)
-{
-    unsigned long long r_sum = 0;
-    unsigned long long g_sum = 0;
-    unsigned long long b_sum = 0;
-    unsigned long long count = 0;
-    int x;
-    int y;
-
-    left = clamp_int(left, 0, width - 1);
-    right = clamp_int(right, 0, width - 1);
-    top = clamp_int(top, 0, height - 1);
-    bottom = clamp_int(bottom, 0, height - 1);
-    if (right < left) {
-        right = left;
-    }
-    if (bottom < top) {
-        bottom = top;
-    }
-
-    for (y = top; y <= bottom; ++y) {
-        for (x = left; x <= right; ++x) {
-            const unsigned char *p = rgb + (y * width + x) * 3;
-
-            r_sum += p[0];
-            g_sum += p[1];
-            b_sum += p[2];
-            ++count;
-        }
-    }
-
-    if (count == 0) {
-        out->r = 0;
-        out->g = 0;
-        out->b = 0;
-        return;
-    }
-
-    out->r = (uint8_t)(r_sum / count);
-    out->g = (uint8_t)(g_sum / count);
-    out->b = (uint8_t)(b_sum / count);
-}
-
 static void compute_average_rectified_patch(const unsigned char *src_rgb,
                                             int src_w,
                                             int src_h,
-                                            const pointf_t pts[T23_BORDER_POINT_COUNT],
-                                            int dst_w,
-                                            int dst_h,
+                                            const rectification_model_t *model,
                                             int left,
                                             int top,
                                             int right,
@@ -739,10 +1777,10 @@ static void compute_average_rectified_patch(const unsigned char *src_rgb,
     int x;
     int y;
 
-    left = clamp_int(left, 0, dst_w - 1);
-    right = clamp_int(right, 0, dst_w - 1);
-    top = clamp_int(top, 0, dst_h - 1);
-    bottom = clamp_int(bottom, 0, dst_h - 1);
+    left = clamp_int(left, 0, model->crop_width - 1);
+    right = clamp_int(right, 0, model->crop_width - 1);
+    top = clamp_int(top, 0, model->crop_height - 1);
+    bottom = clamp_int(bottom, 0, model->crop_height - 1);
     if (right < left) {
         right = left;
     }
@@ -752,9 +1790,11 @@ static void compute_average_rectified_patch(const unsigned char *src_rgb,
 
     for (y = top; y <= bottom; ++y) {
         for (x = left; x <= right; ++x) {
-            double u = (dst_w > 1) ? (double)x / (double)(dst_w - 1) : 0.0;
-            double v = (dst_h > 1) ? (double)y / (double)(dst_h - 1) : 0.0;
-            pointf_t src = coons_patch_point(pts, u, v);
+            pointf_t src;
+
+            if (rectified_crop_point_to_source(model, (double)x, (double)y, &src) < 0) {
+                continue;
+            }
 
             r_sum += bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 0);
             g_sum += bilinear_sample_channel(src_rgb, src_w, src_h, src.x, src.y, 1);
@@ -800,7 +1840,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
 {
     const border_layout_desc_t *layout = get_border_layout_desc(layout_id);
     unsigned char *src_rgb = NULL;
-    pointf_t pts[T23_BORDER_POINT_COUNT];
+    rectification_model_t model;
     int src_w = 0;
     int src_h = 0;
     int image_w = 0;
@@ -819,8 +1859,13 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         return -1;
     }
 
-    scaled_calibration_points(&g_calibration, src_w, src_h, pts);
-    compute_rectified_size(pts, &image_w, &image_h);
+    if (build_rectification_model(&g_calibration, src_w, src_h, &model) < 0) {
+        free(src_rgb);
+        return -1;
+    }
+
+    image_w = model.crop_width;
+    image_h = model.crop_height;
     rect_left = 0;
     rect_top = 0;
     rect_right = image_w - 1;
@@ -835,7 +1880,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int x1 = rect_left + (int)((long long)rect_w * (i + 1) / layout->top_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, x0, rect_top, x1, rect_top + thickness - 1, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, &model, x0, rect_top, x1, rect_top + thickness - 1, &blocks[idx].color);
         ++idx;
     }
 
@@ -844,7 +1889,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int y1 = rect_top + (int)((long long)rect_h * (i + 1) / layout->right_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, rect_right - thickness + 1, y0, rect_right, y1, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, &model, rect_right - thickness + 1, y0, rect_right, y1, &blocks[idx].color);
         ++idx;
     }
 
@@ -853,7 +1898,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int x1 = rect_left + (int)((long long)rect_w * (layout->bottom_blocks - i) / layout->bottom_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, x0, rect_bottom - thickness + 1, x1, rect_bottom, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, &model, x0, rect_bottom - thickness + 1, x1, rect_bottom, &blocks[idx].color);
         ++idx;
     }
 
@@ -862,7 +1907,7 @@ static int compute_border_blocks_from_calibration(const unsigned char *src_jpeg,
         int y1 = rect_top + (int)((long long)rect_h * (layout->left_blocks - i) / layout->left_blocks) - 1;
 
         blocks[idx].block_index = (uint8_t)idx;
-        compute_average_rectified_patch(src_rgb, src_w, src_h, pts, image_w, image_h, rect_left, y0, rect_left + thickness - 1, y1, &blocks[idx].color);
+        compute_average_rectified_patch(src_rgb, src_w, src_h, &model, rect_left, y0, rect_left + thickness - 1, y1, &blocks[idx].color);
         ++idx;
     }
 
@@ -1254,11 +2299,9 @@ static void unbind_jpeg_channels(void)
     }
 }
 
-static int startup_pipeline(void)
+static int startup_pipeline_with_cfg(const sample_sensor_cfg_t *sensor_cfg)
 {
-    sample_sensor_cfg_t sensor_cfg = make_sensor_cfg();
-
-    if (sample_system_init(sensor_cfg) < 0) {
+    if (sample_system_init(*sensor_cfg) < 0) {
         return -1;
     }
     if (sample_framesource_init() < 0) {
@@ -1302,6 +2345,13 @@ static int startup_pipeline(void)
     }
 
     return 0;
+}
+
+static int startup_pipeline(void)
+{
+    sample_sensor_cfg_t sensor_cfg = make_sensor_cfg();
+
+    return startup_pipeline_with_cfg(&sensor_cfg);
 }
 
 /*
@@ -1783,6 +2833,7 @@ static void send_calibration(int fd)
           "CAL SIZE %u %u",
           (unsigned int)g_calibration.image_width,
           (unsigned int)g_calibration.image_height);
+
     len = (size_t)snprintf(line, sizeof(line), "CAL POINTS");
     for (i = 0; i < T23_BORDER_POINT_COUNT && len + 24 < sizeof(line); ++i) {
         len += (size_t)snprintf(line + len,
@@ -1793,6 +2844,21 @@ static void send_calibration(int fd)
     }
     send_line(fd, line);
     send_line(fd, "OK CAL GET");
+}
+
+static void send_lens_status(int fd)
+{
+    sendf(fd,
+          "LENS PRESET %d %d %d %d %d %d %d %d",
+          1,
+          (int)lrint(FISHEYE_FX * 1000.0),
+          (int)lrint(FISHEYE_FY * 1000.0),
+          (int)lrint(FISHEYE_CX * 1000.0),
+          (int)lrint(FISHEYE_CY * 1000.0),
+          (int)lrint(FISHEYE_K1 * 1000000.0),
+          (int)lrint(FISHEYE_K2 * 1000000.0),
+          (int)lrint(FISHEYE_KNEW_SCALE * 1000.0));
+    send_line(fd, "OK LENS GET");
 }
 
 static void handle_cal_set(int fd, char *args)
@@ -1825,6 +2891,7 @@ static void handle_cal_set(int fd, char *args)
     }
 
     sanitize_calibration(&cal);
+
     g_calibration = cal;
 
     send_calibration(fd);
@@ -1886,6 +2953,29 @@ static int capture_jpeg_once(unsigned char *out_buf, size_t *out_len)
 
     *out_len = total;
     return 0;
+}
+
+static int capture_hires_jpeg_once(unsigned char *out_buf, size_t *out_len)
+{
+    sample_sensor_cfg_t hi_cfg = make_sensor_cfg_with_size(HIRES_SNAPSHOT_WIDTH, HIRES_SNAPSHOT_HEIGHT);
+    int ret = -1;
+
+    /*
+     * High-resolution snapshots are intentionally handled as a one-shot mode
+     * switch. This keeps the normal 640x320 preview path low-latency while
+     * still letting calibration capture a genuinely higher resolution frame.
+     */
+    shutdown_pipeline();
+    if (startup_pipeline_with_cfg(&hi_cfg) == 0) {
+        ret = capture_jpeg_once(out_buf, out_len);
+    }
+    shutdown_pipeline();
+    if (startup_pipeline() < 0) {
+        fprintf(stderr, "failed to restore preview pipeline after hi-res snapshot\n");
+        g_running = 0;
+    }
+
+    return ret;
 }
 
 static int ensure_gpio_exported(int gpio)
@@ -2179,6 +3269,21 @@ static void handle_snap(int fd)
     }
 }
 
+static void handle_snap_hires(int fd)
+{
+    size_t jpeg_len = 0;
+
+    if (capture_hires_jpeg_once(g_jpeg_buf, &jpeg_len) < 0) {
+        send_line(fd, "ERR SNAP_HIRES");
+        return;
+    }
+
+    sendf(fd, "SNAP HIRES OK %u", (unsigned int)jpeg_len);
+    if (push_jpeg_over_spi(g_jpeg_buf, jpeg_len) < 0) {
+        send_line(fd, "ERR SNAP_HIRES_SPI");
+    }
+}
+
 static void handle_cal_snap(int fd)
 {
     size_t jpeg_len = 0;
@@ -2197,6 +3302,102 @@ static void handle_cal_snap(int fd)
     sendf(fd, "CAL SNAP OK %u", (unsigned int)rectified_len);
     if (push_jpeg_over_spi(g_jpeg_buf, rectified_len) < 0) {
         send_line(fd, "ERR CAL_SNAP_SPI");
+    }
+}
+
+static int undistort_jpeg_with_fixed_fisheye(const unsigned char *src_jpeg,
+                                             size_t src_jpeg_len,
+                                             unsigned char *out_jpeg,
+                                             size_t out_jpeg_capacity,
+                                             size_t *out_jpeg_len)
+{
+    unsigned char *src_rgb = NULL;
+    unsigned char *dst_rgb = NULL;
+    unsigned char *jpeg_mem = NULL;
+    size_t jpeg_size = 0;
+    rectification_model_t model;
+    int src_w = 0;
+    int src_h = 0;
+    int x;
+    int y;
+
+    if (decode_jpeg_to_rgb888(src_jpeg, (unsigned long)src_jpeg_len, &src_rgb, &src_w, &src_h) < 0) {
+        return -1;
+    }
+
+    memset(&model, 0, sizeof(model));
+    if (init_calibration_fisheye_profile(&model, src_w, src_h) < 0) {
+        free(src_rgb);
+        return -1;
+    }
+
+    dst_rgb = malloc((size_t)src_w * src_h * 3);
+    if (dst_rgb == NULL) {
+        free(src_rgb);
+        return -1;
+    }
+
+    for (y = 0; y < src_h; ++y) {
+        for (x = 0; x < src_w; ++x) {
+            pointf_t undist_pt;
+            pointf_t src_pt;
+            unsigned char *pixel = dst_rgb + (y * src_w + x) * 3;
+
+            undist_pt.x = (double)x;
+            undist_pt.y = (double)y;
+            if (distort_point_with_fisheye(&model, &undist_pt, &src_pt) < 0) {
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
+                continue;
+            }
+
+            pixel[0] = bilinear_sample_channel(src_rgb, src_w, src_h, src_pt.x, src_pt.y, 0);
+            pixel[1] = bilinear_sample_channel(src_rgb, src_w, src_h, src_pt.x, src_pt.y, 1);
+            pixel[2] = bilinear_sample_channel(src_rgb, src_w, src_h, src_pt.x, src_pt.y, 2);
+        }
+    }
+
+    if (encode_rgb888_to_jpeg(dst_rgb, src_w, src_h, &jpeg_mem, &jpeg_size) < 0) {
+        free(dst_rgb);
+        free(src_rgb);
+        return -1;
+    }
+
+    if (jpeg_size == 0 || jpeg_size > out_jpeg_capacity) {
+        free(jpeg_mem);
+        free(dst_rgb);
+        free(src_rgb);
+        return -1;
+    }
+
+    memcpy(out_jpeg, jpeg_mem, jpeg_size);
+    *out_jpeg_len = jpeg_size;
+
+    free(jpeg_mem);
+    free(dst_rgb);
+    free(src_rgb);
+    return 0;
+}
+
+static void handle_cal_undistorted_snap(int fd)
+{
+    size_t jpeg_len = 0;
+    size_t undistorted_len = 0;
+
+    if (capture_jpeg_once(g_jpeg_buf, &jpeg_len) < 0) {
+        send_line(fd, "ERR CAL_USNAP");
+        return;
+    }
+
+    if (undistort_jpeg_with_fixed_fisheye(g_jpeg_buf, jpeg_len, g_jpeg_buf, sizeof(g_jpeg_buf), &undistorted_len) < 0) {
+        send_line(fd, "ERR CAL_UNDISTORT");
+        return;
+    }
+
+    sendf(fd, "CAL USNAP OK %u", (unsigned int)undistorted_len);
+    if (push_jpeg_over_spi(g_jpeg_buf, undistorted_len) < 0) {
+        send_line(fd, "ERR CAL_USNAP_SPI");
     }
 }
 
@@ -2219,7 +3420,7 @@ static void process_command(int fd, char *line)
     }
 
     if (strcmp(cmd, "HELP") == 0) {
-        send_line(fd, "INFO commands: PING, HELP, MODE GET|SET <DEBUG|RUN>, LAYOUT GET|SET <16X9|4X3>, GET <PARAM|ALL>, SET <PARAM> <VALUE>, SNAP, FRAME, CAL GET, CAL SET, CAL SNAP, BLOCKS GET");
+        send_line(fd, "INFO commands: PING, HELP, MODE GET|SET <DEBUG|RUN>, LAYOUT GET|SET <16X9|4X3>, GET <PARAM|ALL>, SET <PARAM> <VALUE>, SNAP [HIRES], FRAME, CAL GET, CAL SET, CAL SNAP, CAL USNAP, LENS GET, BLOCKS GET");
         return;
     }
 
@@ -2262,6 +3463,23 @@ static void process_command(int fd, char *line)
         }
 
         send_line(fd, "ERR unknown-mode-subcommand");
+        return;
+    }
+
+    if (strcmp(cmd, "LENS") == 0) {
+        arg1 = strtok_r(NULL, " ", &saveptr);
+        if (arg1 == NULL) {
+            send_line(fd, "ERR missing-lens-subcommand");
+            return;
+        }
+        strtoupper(arg1);
+
+        if (strcmp(arg1, "GET") == 0) {
+            send_lens_status(fd);
+            return;
+        }
+
+        send_line(fd, "ERR unknown-lens-subcommand");
         return;
     }
 
@@ -2308,6 +3526,14 @@ static void process_command(int fd, char *line)
     }
 
     if (strcmp(cmd, "SNAP") == 0) {
+        arg1 = strtok_r(NULL, " ", &saveptr);
+        if (arg1 != NULL) {
+            strtoupper(arg1);
+            if (strcmp(arg1, "HIRES") == 0) {
+                handle_snap_hires(fd);
+                return;
+            }
+        }
         handle_snap(fd);
         return;
     }
@@ -2358,6 +3584,11 @@ static void process_command(int fd, char *line)
 
         if (strcmp(arg1, "SNAP") == 0) {
             handle_cal_snap(fd);
+            return;
+        }
+
+        if (strcmp(arg1, "USNAP") == 0) {
+            handle_cal_undistorted_snap(fd);
             return;
         }
 

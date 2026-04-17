@@ -5,10 +5,11 @@
 如果你现在只想快速理解项目，不要再分散读很多文档，直接按下面顺序看：
 
 1. [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)
-2. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
-3. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
-4. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
-5. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
+2. [校正算法详解](/home/kuan/T23-C3-Project/docs/rectification_algorithm_zh.md)
+3. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
+4. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
+5. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
+6. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
 
 总指南里现在已经统一包含：
 
@@ -17,6 +18,10 @@
 - 关键调用顺序表
 - 关键函数功能表
 - 当前校正算法与灯带链路说明
+
+如果你只关心这次和 Python 对齐后的校正实现，直接看：
+
+- [校正算法详解](/home/kuan/T23-C3-Project/docs/rectification_algorithm_zh.md)
 
 ## 目录说明
 

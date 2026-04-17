@@ -7,7 +7,7 @@
  * Shared data model for TV border calibration and future 50-block extraction.
  *
  * The current stage only implements:
- * - a 10-point calibration model
+ * - an 8-point calibration model
  * - transport between web UI <-> C3 <-> T23
  * - a rectified rectangle guide preview
  *
@@ -17,7 +17,7 @@
  * - final 50-color LED output
  */
 
-#define T23_BORDER_POINT_COUNT 10u
+#define T23_BORDER_POINT_COUNT 8u
 #define T23_BORDER_BLOCK_COUNT_MAX 50u
 
 #define T23_BORDER_LAYOUT_16X9_TOP 16u
@@ -33,24 +33,20 @@
 typedef enum {
     /* top-left corner */
     T23_BORDER_POINT_TL = 0,
-    /* top edge quarter point near left */
-    T23_BORDER_POINT_TML = 1,
     /* top edge midpoint */
-    T23_BORDER_POINT_TM = 2,
-    /* top edge quarter point near right */
-    T23_BORDER_POINT_TMR = 3,
+    T23_BORDER_POINT_TM = 1,
     /* top-right corner */
-    T23_BORDER_POINT_TR = 4,
+    T23_BORDER_POINT_TR = 2,
     /* right edge midpoint */
-    T23_BORDER_POINT_RM = 5,
+    T23_BORDER_POINT_RM = 3,
     /* bottom-right corner */
-    T23_BORDER_POINT_BR = 6,
+    T23_BORDER_POINT_BR = 4,
     /* bottom edge midpoint */
-    T23_BORDER_POINT_BM = 7,
+    T23_BORDER_POINT_BM = 5,
     /* bottom-left corner */
-    T23_BORDER_POINT_BL = 8,
+    T23_BORDER_POINT_BL = 6,
     /* left edge midpoint */
-    T23_BORDER_POINT_LM = 9,
+    T23_BORDER_POINT_LM = 7,
 } t23_border_point_id_t;
 
 typedef enum {

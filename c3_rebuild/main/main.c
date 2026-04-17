@@ -52,6 +52,7 @@
 
 #define UART_LINE_MAX 256
 #define JPEG_MAX_SIZE (128 * 1024)
+#define HIRES_JPEG_MAX_SIZE (256 * 1024)
 #define JPEG_MIN_SIZE (32 * 1024)
 #define PREVIEW_REFRESH_MS 200
 #define ISP_SAVE_MAGIC 0x49535031u
@@ -221,6 +222,8 @@ static const led_color_order_desc_t *g_led_color_order = &g_color_order_rgb;
 static const led_strip_profile_desc_t *g_led_strip_profile = &g_strip_profile_5m;
 static saved_isp_params_t g_saved_isp_params;
 static int g_saved_isp_params_valid = 0;
+static saved_isp_params_t g_default_isp_params;
+static int g_default_isp_params_valid = 0;
 static led_color_calibration_t g_led_cal = {
     .magic = LED_CAL_MAGIC,
     .gain = { 100, 100, 100 },
@@ -638,28 +641,28 @@ static esp_err_t save_wifi_config(void)
     return ret;
 }
 
-static void load_saved_isp_params(void)
+static void load_isp_params_blob(const char *key, saved_isp_params_t *params, int *valid_flag)
 {
     nvs_handle_t nvs = 0;
-    size_t len = sizeof(g_saved_isp_params);
+    size_t len = sizeof(*params);
 
-    memset(&g_saved_isp_params, 0, sizeof(g_saved_isp_params));
-    g_saved_isp_params_valid = 0;
+    memset(params, 0, sizeof(*params));
+    *valid_flag = 0;
 
     if (nvs_open("c3cfg", NVS_READONLY, &nvs) != ESP_OK) {
         return;
     }
 
-    if (nvs_get_blob(nvs, "isp_params", &g_saved_isp_params, &len) == ESP_OK &&
-        len == sizeof(g_saved_isp_params) &&
-        g_saved_isp_params.magic == ISP_SAVE_MAGIC) {
-        g_saved_isp_params_valid = 1;
+    if (nvs_get_blob(nvs, key, params, &len) == ESP_OK &&
+        len == sizeof(*params) &&
+        params->magic == ISP_SAVE_MAGIC) {
+        *valid_flag = 1;
     }
 
     nvs_close(nvs);
 }
 
-static esp_err_t save_saved_isp_params(void)
+static esp_err_t save_isp_params_blob(const char *key, const saved_isp_params_t *params)
 {
     nvs_handle_t nvs = 0;
     esp_err_t ret = nvs_open("c3cfg", NVS_READWRITE, &nvs);
@@ -668,13 +671,33 @@ static esp_err_t save_saved_isp_params(void)
         return ret;
     }
 
-    ret = nvs_set_blob(nvs, "isp_params", &g_saved_isp_params, sizeof(g_saved_isp_params));
+    ret = nvs_set_blob(nvs, key, params, sizeof(*params));
     if (ret == ESP_OK) {
         ret = nvs_commit(nvs);
     }
 
     nvs_close(nvs);
     return ret;
+}
+
+static void load_saved_isp_params(void)
+{
+    load_isp_params_blob("isp_params", &g_saved_isp_params, &g_saved_isp_params_valid);
+}
+
+static void load_default_isp_params(void)
+{
+    load_isp_params_blob("isp_defaults", &g_default_isp_params, &g_default_isp_params_valid);
+}
+
+static esp_err_t save_saved_isp_params(void)
+{
+    return save_isp_params_blob("isp_params", &g_saved_isp_params);
+}
+
+static esp_err_t save_default_isp_params(void)
+{
+    return save_isp_params_blob("isp_defaults", &g_default_isp_params);
 }
 
 static const border_layout_desc_t *find_layout_desc(const char *name)
@@ -1124,6 +1147,8 @@ static const char g_index_html[] =
     "          </div>\n"
     "          <div class=\"button-row\">\n"
     "          <button id=\"snapBtn\">Capture Snapshot</button>\n"
+    "          <button id=\"saveSnapBtn\">Save Snapshot</button>\n"
+    "          <button id=\"saveHiResSnapBtn\">Save Hi-Res Snapshot</button>\n"
     "          <button id=\"autoPreviewBtn\">Start Auto Preview</button>\n"
     "          <button id=\"enterRunBtn\">Enter Run Mode</button>\n"
     "          <button id=\"returnDebugBtn\">Return To Debug Mode</button>\n"
@@ -1132,7 +1157,7 @@ static const char g_index_html[] =
     "      </div>\n"
     "    </section>\n"
     "    <section class=\"panel\" id=\"ispPanel\">\n"
-    "      <div class=\"section-header\"><h2>ISP Controls</h2><button id=\"saveParamsBtn\">Save Startup Params</button></div>\n"
+    "      <div class=\"section-header\"><h2>ISP Controls</h2><div class=\"button-row\"><button id=\"restoreDefaultBtn\">Restore T23 Defaults</button><button id=\"restoreSavedBtn\">Restore Saved Params</button><button id=\"saveParamsBtn\">Save Startup Params</button></div></div>\n"
     "      <div class=\"grid\" id=\"paramGrid\"></div>\n"
     "    </section>\n"
     "    <section class=\"panel\" id=\"ledCalPanel\">\n"
@@ -1172,16 +1197,31 @@ static const char g_index_html[] =
     "        <h2>Border Calibration</h2>\n"
     "        <span class=\"preview-status\" id=\"calibrationStatus\">Idle</span>\n"
     "      </div>\n"
-    "      <p class=\"subtitle\">Drag 10 points around the TV border: 4 corners, 4 side or bottom midpoints, and 2 extra top-edge control points for the long fisheye arc. Click confirm to store the calibration in T23 and fetch a real rectified preview rendered inside T23.</p>\n"
+    "      <p class=\"subtitle\">Drag 8 points on the original full-FOV calibration image, then confirm the final 16:9 rectified preview. The final rectification still uses the fixed fisheye lens parameters.</p>\n"
+    "      <div class=\"section-header section-header--tight\">\n"
+    "        <h3>Lens Parameters</h3>\n"
+    "        <span class=\"preview-status\" id=\"lensStatus\">Lens preset idle</span>\n"
+    "      </div>\n"
+    "      <div class=\"button-row calibration-actions\">\n"
+    "        <button id=\"updateLensBtn\">Update Lens Params</button>\n"
+    "      </div>\n"
     "      <div class=\"button-row calibration-actions\">\n"
     "        <button id=\"loadCalibrationSnapBtn\">Load Calibration Snapshot</button>\n"
-    "        <button id=\"resetCalibrationBtn\">Reset 10 Points</button>\n"
-    "        <button id=\"saveCalibrationBtn\">Confirm 10 Points</button>\n"
+    "        <button id=\"resetCalibrationBtn\">Reset 8 Points</button>\n"
+    "        <button id=\"saveCalibrationBtn\">Confirm 8 Points</button>\n"
+    "        <button id=\"horizontalLockBtn\">Horizontal Lock: On</button>\n"
+    "        <button id=\"symmetryLockBtn\">Symmetry Lock: Off</button>\n"
     "      </div>\n"
     "      <div class=\"calibration-grid\">\n"
     "        <div class=\"calibration-pane\">\n"
     "          <h3>Interactive Calibration</h3>\n"
     "          <canvas id=\"calibrationCanvas\" width=\"640\" height=\"320\"></canvas>\n"
+    "          <div class=\"calibration-tools\">\n"
+    "            <div class=\"magnifier-wrap\">\n"
+    "              <canvas id=\"magnifierCanvas\" width=\"180\" height=\"180\"></canvas>\n"
+    "            </div>\n"
+    "            <p class=\"calibration-hint\">Drag points on the raw fisheye image. Use arrow keys for 1px nudges, Shift+Arrow for 5px nudges. When you release the mouse, the point will snap to the nearest strong edge.</p>\n"
+    "          </div>\n"
     "        </div>\n"
     "        <div class=\"calibration-pane\">\n"
     "          <h3>Rectified Preview</h3>\n"
@@ -1252,6 +1292,10 @@ static const char g_styles_css[] =
     ".calibration-pane h3 { margin: 0 0 10px; font-size: 18px; }\n"
     ".calibration-pane canvas { width: 100%; height: auto; border: 1px dashed var(--line); border-radius: 16px; background: #fbfcf8; display: block; }\n"
     ".calibration-actions { margin-bottom: 16px; flex-wrap: wrap; }\n"
+    ".calibration-tools { display: grid; grid-template-columns: 180px 1fr; gap: 14px; margin-top: 14px; align-items: start; }\n"
+    ".magnifier-wrap canvas { width: 180px; height: 180px; border: 1px solid var(--line); border-radius: 14px; background: #0f1713; display: block; }\n"
+    ".calibration-hint { margin: 0; color: var(--muted); line-height: 1.6; }\n"
+    ".rectify-tune-card { margin-bottom: 16px; }\n"
     ".preview-status { display: inline-flex; align-items: center; min-height: 36px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: #f7faf4; color: var(--muted); font-weight: 700; }\n"
     ".preview-status.is-busy { color: var(--accent); border-color: rgba(13, 107, 87, 0.3); background: rgba(13, 107, 87, 0.08); }\n"
     ".preview-status.is-good { color: var(--good); border-color: rgba(20, 128, 74, 0.25); background: rgba(20, 128, 74, 0.08); }\n"
@@ -1260,7 +1304,7 @@ static const char g_styles_css[] =
     "#previewImage, #borderCanvas { max-width: 100%; max-height: 560px; display: block; }\n"
     ".log-box { min-height: 180px; max-height: 300px; overflow: auto; padding: 14px; background: #122019; color: #cce7db; border-radius: 14px; white-space: pre-wrap; }\n"
     "@media (max-width: 980px) { .hero-panels { grid-template-columns: 1fr; } }\n"
-    "@media (max-width: 820px) { .button-row { flex-wrap: wrap; } }\n";
+    "@media (max-width: 820px) { .button-row { flex-wrap: wrap; } .calibration-tools { grid-template-columns: 1fr; } .magnifier-wrap canvas { width: min(220px, 100%); height: auto; aspect-ratio: 1 / 1; } }\n";
 
 static const char g_app_js[] =
     "const PARAMS=[\n"
@@ -1281,12 +1325,13 @@ static const char g_app_js[] =
     " {key:'G_GAMMA',json:'gGamma',label:'Green Gamma',min:50,max:300,step:1,suffix:'',format:v=>(v/100).toFixed(2)},\n"
     " {key:'B_GAMMA',json:'bGamma',label:'Blue Gamma',min:50,max:300,step:1,suffix:'',format:v=>(v/100).toFixed(2)}\n"
     "];\n"
-    "const POINT_LABELS=['TL','TML','TM','TMR','TR','RM','BR','BM','BL','LM'];\n"
-    "const ui={snapBtn:document.getElementById('snapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),statusText:document.getElementById('statusText'),wifiStatusBadge:document.getElementById('wifiStatusBadge'),wifiHint:document.getElementById('wifiHint'),wifiScanSelect:document.getElementById('wifiScanSelect'),wifiScanBtn:document.getElementById('wifiScanBtn'),wifiSsidInput:document.getElementById('wifiSsidInput'),wifiPassInput:document.getElementById('wifiPassInput'),wifiSaveBtn:document.getElementById('wifiSaveBtn'),wifiForgetBtn:document.getElementById('wifiForgetBtn'),layoutSelect:document.getElementById('layoutSelect'),stripProfileSelect:document.getElementById('stripProfileSelect'),installModeSelect:document.getElementById('installModeSelect'),colorOrderSelect:document.getElementById('colorOrderSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),saveParamsBtn:document.getElementById('saveParamsBtn'),ledCalPanel:document.getElementById('ledCalPanel'),ledCalGrid:document.getElementById('ledCalGrid'),ledCalStatus:document.getElementById('ledCalStatus'),ledCalSaveBtn:document.getElementById('ledCalSaveBtn'),ledTestWhiteBtn:document.getElementById('ledTestWhiteBtn'),ledTestRedBtn:document.getElementById('ledTestRedBtn'),ledTestGreenBtn:document.getElementById('ledTestGreenBtn'),ledTestBlueBtn:document.getElementById('ledTestBlueBtn'),ledTestCyanBtn:document.getElementById('ledTestCyanBtn'),ledTestMagentaBtn:document.getElementById('ledTestMagentaBtn'),ledTestYellowBtn:document.getElementById('ledTestYellowBtn'),ledTestLiveBtn:document.getElementById('ledTestLiveBtn'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
-    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',stripProfile:'5M',installMode:'LEFT_TOP',colorOrder:'RGB',installGuideActive:true,wifiConfigured:true,wifiConnected:false,wifiSsid:'',wifiIp:'',lastBlocksAt:0,defaultsLoaded:false,ledCal:{rGain:100,gGain:100,bGain:100,rGamma:100,gGamma:100,bGamma:100,testMode:'LIVE'},calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1};\n"
+    "const POINT_LABELS=['TL','TM','TR','RM','BR','BM','BL','LM'];\n"
+    "const ui={snapBtn:document.getElementById('snapBtn'),saveSnapBtn:document.getElementById('saveSnapBtn'),saveHiResSnapBtn:document.getElementById('saveHiResSnapBtn'),autoPreviewBtn:document.getElementById('autoPreviewBtn'),enterRunBtn:document.getElementById('enterRunBtn'),returnDebugBtn:document.getElementById('returnDebugBtn'),modeBadge:document.getElementById('modeBadge'),statusText:document.getElementById('statusText'),wifiStatusBadge:document.getElementById('wifiStatusBadge'),wifiHint:document.getElementById('wifiHint'),wifiScanSelect:document.getElementById('wifiScanSelect'),wifiScanBtn:document.getElementById('wifiScanBtn'),wifiSsidInput:document.getElementById('wifiSsidInput'),wifiPassInput:document.getElementById('wifiPassInput'),wifiSaveBtn:document.getElementById('wifiSaveBtn'),wifiForgetBtn:document.getElementById('wifiForgetBtn'),layoutSelect:document.getElementById('layoutSelect'),stripProfileSelect:document.getElementById('stripProfileSelect'),installModeSelect:document.getElementById('installModeSelect'),colorOrderSelect:document.getElementById('colorOrderSelect'),showInstallGuideBtn:document.getElementById('showInstallGuideBtn'),ispPanel:document.getElementById('ispPanel'),saveParamsBtn:document.getElementById('saveParamsBtn'),restoreDefaultBtn:document.getElementById('restoreDefaultBtn'),restoreSavedBtn:document.getElementById('restoreSavedBtn'),ledCalPanel:document.getElementById('ledCalPanel'),ledCalGrid:document.getElementById('ledCalGrid'),ledCalStatus:document.getElementById('ledCalStatus'),ledCalSaveBtn:document.getElementById('ledCalSaveBtn'),ledTestWhiteBtn:document.getElementById('ledTestWhiteBtn'),ledTestRedBtn:document.getElementById('ledTestRedBtn'),ledTestGreenBtn:document.getElementById('ledTestGreenBtn'),ledTestBlueBtn:document.getElementById('ledTestBlueBtn'),ledTestCyanBtn:document.getElementById('ledTestCyanBtn'),ledTestMagentaBtn:document.getElementById('ledTestMagentaBtn'),ledTestYellowBtn:document.getElementById('ledTestYellowBtn'),ledTestLiveBtn:document.getElementById('ledTestLiveBtn'),originalPane:document.getElementById('originalPane'),calibrationPanel:document.getElementById('calibrationPanel'),clearLogBtn:document.getElementById('clearLogBtn'),paramGrid:document.getElementById('paramGrid'),logBox:document.getElementById('logBox'),previewImage:document.getElementById('previewImage'),borderCanvas:document.getElementById('borderCanvas'),previewStatus:document.getElementById('previewStatus'),lensStatus:document.getElementById('lensStatus'),updateLensBtn:document.getElementById('updateLensBtn'),loadCalibrationSnapBtn:document.getElementById('loadCalibrationSnapBtn'),resetCalibrationBtn:document.getElementById('resetCalibrationBtn'),saveCalibrationBtn:document.getElementById('saveCalibrationBtn'),horizontalLockBtn:document.getElementById('horizontalLockBtn'),symmetryLockBtn:document.getElementById('symmetryLockBtn'),calibrationStatus:document.getElementById('calibrationStatus'),calibrationCanvas:document.getElementById('calibrationCanvas'),magnifierCanvas:document.getElementById('magnifierCanvas'),rectifiedCanvas:document.getElementById('rectifiedCanvas')};\n"
+    "const state={autoPreviewTimer:null,previewBusy:false,runtimeBusy:false,previewUrl:null,calibrationImage:null,rectifiedImage:null,borderData:null,mode:'DEBUG',layout:'16X9',stripProfile:'5M',installMode:'LEFT_TOP',colorOrder:'RGB',installGuideActive:true,wifiConfigured:true,wifiConnected:false,wifiSsid:'',wifiIp:'',lastBlocksAt:0,defaultsLoaded:false,ledCal:{rGain:100,gGain:100,bGain:100,rGamma:100,gGamma:100,bGamma:100,testMode:'LIVE'},lens:{deviceValid:false,k1Scaled:0,k2Scaled:0,knewScale:1,fx:0,fy:0,cx:0,cy:0},calibration:{imageWidth:640,imageHeight:320,points:[]},dragIndex:-1,selectedIndex:0,hoverPos:null,calibrationImageData:null,calibrationSampleCanvas:null,horizontalLock:true,symmetryLock:false};\n"
     "function log(m){const ts=new Date().toLocaleTimeString();ui.logBox.textContent+=`[${ts}] ${m}\\n`;ui.logBox.scrollTop=ui.logBox.scrollHeight;}\n"
     "function setPreviewStatus(t,k='idle'){ui.previewStatus.textContent=t;ui.previewStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.previewStatus.classList.add('is-busy');else if(k==='good')ui.previewStatus.classList.add('is-good');else if(k==='bad')ui.previewStatus.classList.add('is-bad');}\n"
     "function setCalibrationStatus(t,k='idle'){ui.calibrationStatus.textContent=t;ui.calibrationStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.calibrationStatus.classList.add('is-busy');else if(k==='good')ui.calibrationStatus.classList.add('is-good');else if(k==='bad')ui.calibrationStatus.classList.add('is-bad');}\n"
+    "function setLensStatus(t,k='idle'){if(!ui.lensStatus)return;ui.lensStatus.textContent=t;ui.lensStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.lensStatus.classList.add('is-busy');else if(k==='good')ui.lensStatus.classList.add('is-good');else if(k==='bad')ui.lensStatus.classList.add('is-bad');}\n"
     "function setLedCalStatus(t,k='idle'){ui.ledCalStatus.textContent=t;ui.ledCalStatus.classList.remove('is-busy','is-good','is-bad');if(k==='busy')ui.ledCalStatus.classList.add('is-busy');else if(k==='good')ui.ledCalStatus.classList.add('is-good');else if(k==='bad')ui.ledCalStatus.classList.add('is-bad');}\n"
     "function waitForImage(img){if(img.complete&&img.naturalWidth>0)return Promise.resolve();return new Promise((resolve,reject)=>{const onLoad=()=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);resolve();};const onError=(e)=>{img.removeEventListener('load',onLoad);img.removeEventListener('error',onError);reject(e);};img.addEventListener('load',onLoad,{once:true});img.addEventListener('error',onError,{once:true});});}\n"
     "function applyLayoutMeta(data){if(!data)return;const layout=data.layout||state.layout||'16X9';state.layout=layout;if(ui.layoutSelect&&ui.layoutSelect.value!==layout)ui.layoutSelect.value=layout;}\n"
@@ -1299,26 +1344,47 @@ static const char g_app_js[] =
     "function applyValues(data){for(const p of PARAMS){if(typeof data[p.key]!=='undefined'){p.slider.value=data[p.key];p.valueLabel.textContent=data[p.key];}}state.defaultsLoaded=true;}\n"
     "function applySingleParamValue(data){if(!data||!data.key)return;const p=PARAMS.find(x=>x.key===data.key);if(!p)return;p.slider.value=data.value;p.valueLabel.textContent=data.value;updateDefaultButtonState(p);}\n"
     "async function saveStartupParams(){setPreviewStatus('Saving startup ISP params...','busy');log('GET /api/params/save');try{await fetchJson('/api/params/save');setPreviewStatus('Startup ISP params saved','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function restoreDefaultParams(){setPreviewStatus('Restoring T23 defaults...','busy');log('GET /api/params/restore_default');try{const data=await fetchJson('/api/params/restore_default');applyValues(data);setPreviewStatus('Restored T23 defaults','good');if(state.mode==='DEBUG')await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function restoreSavedParams(){setPreviewStatus('Restoring saved startup params...','busy');log('GET /api/params/restore_saved');try{const data=await fetchJson('/api/params/restore_saved');applyValues(data);setPreviewStatus('Restored saved startup params','good');if(state.mode==='DEBUG')await refreshPreviewAndBlocks();}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "function renderLedCal(){ui.ledCalGrid.innerHTML='';for(const p of LED_CAL_PARAMS){const card=document.createElement('article');card.className='param-card';card.innerHTML=`<header><label for=\"led-${p.key}\">${p.label}</label><span class=\"value\" id=\"led-value-${p.key}\">-</span></header><input id=\"led-${p.key}\" type=\"range\" min=\"${p.min}\" max=\"${p.max}\" step=\"${p.step}\" value=\"${p.min}\">`;ui.ledCalGrid.appendChild(card);const slider=document.getElementById(`led-${p.key}`);const value=document.getElementById(`led-value-${p.key}`);slider.oninput=()=>{value.textContent=p.format(Number(slider.value));};slider.onchange=()=>setLedCalParam(p.key,slider.value);p.slider=slider;p.valueLabel=value;}}\n"
     "function applyLedCal(data){if(!data)return;state.ledCal={...state.ledCal,...data};for(const p of LED_CAL_PARAMS){if(typeof state.ledCal[p.json]!=='undefined'&&p.slider&&p.valueLabel){p.slider.value=state.ledCal[p.json];p.valueLabel.textContent=p.format(Number(state.ledCal[p.json]));}}}\n"
     "async function refreshLedCal(){setLedCalStatus('Refreshing LED calibration...','busy');log('GET /api/led_cal');try{const data=await fetchJson('/api/led_cal');applyLedCal(data);setLedCalStatus(`LED mode: ${data.testMode||'LIVE'}`,'good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setLedCalParam(key,value){log(`GET /api/led_cal/set?key=${key}&value=${value}`);setLedCalStatus(`Applying ${key}...`,'busy');try{const data=await fetchJson(`/api/led_cal/set?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`);applyLedCal(data);setLedCalStatus(`Applied ${key}`,'good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function saveLedCal(){log('GET /api/led_cal/save');setLedCalStatus('Saving LED calibration...','busy');try{const data=await fetchJson('/api/led_cal/save');applyLedCal(data);setLedCalStatus('LED calibration saved','good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function setLedTest(mode){log(`GET /api/led_cal/test?mode=${mode}`);setLedCalStatus(`Switching to ${mode}...`,'busy');try{const data=await fetchJson(`/api/led_cal/test?mode=${encodeURIComponent(mode)}`);applyLedCal(data);setLedCalStatus(`LED test mode: ${data.testMode}`,'good');}catch(e){log(`ERR ${e.message}`);setLedCalStatus(`ERR ${e.message}`,'bad');}}\n"
-    "function makeDefaultCalibration(w,h){const left=Math.round(w/8),right=Math.round(w-left),top=Math.round(h/8),bottom=Math.round(h-top),span=right-left,tml=Math.round(left+span/4),cx=Math.round(w/2),tmr=Math.round(right-span/4),cy=Math.round(h/2);return{imageWidth:w,imageHeight:h,points:[{x:left,y:top},{x:tml,y:top},{x:cx,y:top},{x:tmr,y:top},{x:right,y:top},{x:right,y:cy},{x:right,y:bottom},{x:cx,y:bottom},{x:left,y:bottom},{x:left,y:cy}]};}\n"
-    "function ensureCalibrationPoints(){if(!state.calibration.points||state.calibration.points.length!==10){state.calibration=makeDefaultCalibration(state.calibration.imageWidth||640,state.calibration.imageHeight||320);}}\n"
-    "function drawCalibrationCanvas(){const c=ui.calibrationCanvas,ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle='#f8fbf5';ctx.fillRect(0,0,c.width,c.height);if(state.calibrationImage){ctx.drawImage(state.calibrationImage,0,0,c.width,c.height);}ctx.strokeStyle='rgba(13,107,87,0.85)';ctx.lineWidth=3;ensureCalibrationPoints();ctx.beginPath();state.calibration.points.forEach((p,i)=>{if(i===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y);});ctx.closePath();ctx.stroke();ctx.font='12px sans-serif';state.calibration.points.forEach((p,i)=>{ctx.beginPath();ctx.fillStyle='#d26a2e';ctx.arc(p.x,p.y,7,0,Math.PI*2);ctx.fill();ctx.fillStyle='#132b21';ctx.fillText(POINT_LABELS[i],p.x+10,p.y-10);});}\n"
-    "function drawRectifiedGuide(){const c=ui.rectifiedCanvas,ctx=c.getContext('2d');const pad=40,w=c.width,h=c.height;const left=pad,right=w-pad,top=pad,bottom=h-pad,cx=Math.round((left+right)/2),cy=Math.round((top+bottom)/2),span=right-left,tml=Math.round(left+span/4),tmr=Math.round(right-span/4);ctx.clearRect(0,0,w,h);ctx.fillStyle='#f8fbf5';ctx.fillRect(0,0,w,h);if(state.rectifiedImage){const img=state.rectifiedImage;const scale=Math.min(w/img.width,h/img.height);const dw=Math.round(img.width*scale),dh=Math.round(img.height*scale);const dx=Math.round((w-dw)/2),dy=Math.round((h-dh)/2);ctx.drawImage(img,dx,dy,dw,dh);ctx.strokeStyle='rgba(13,107,87,0.45)';ctx.lineWidth=2;ctx.strokeRect(dx,dy,dw,dh);ctx.fillStyle='#5b6b61';ctx.fillText('Rectified preview rendered by T23',pad,h-12);return;}ctx.strokeStyle='rgba(13,107,87,0.85)';ctx.lineWidth=3;ctx.strokeRect(left,top,right-left,bottom-top);const pts=[[left,top],[tml,top],[cx,top],[tmr,top],[right,top],[right,cy],[right,bottom],[cx,bottom],[left,bottom],[left,cy]];ctx.font='12px sans-serif';pts.forEach((p,i)=>{ctx.beginPath();ctx.fillStyle='#0d6b57';ctx.arc(p[0],p[1],7,0,Math.PI*2);ctx.fill();ctx.fillStyle='#132b21';ctx.fillText(POINT_LABELS[i],p[0]+10,p[1]-10);});ctx.fillStyle='#5b6b61';ctx.fillText('Rectified preview will appear here after calibration confirm',pad,h-12);}\n"
+    "function makeDefaultCalibration(w,h){return{imageWidth:w,imageHeight:h,points:[{x:Math.round(w*0.02),y:Math.round(h*0.42)},{x:Math.round(w*0.50),y:Math.round(h*0.23)},{x:Math.round(w*0.98),y:Math.round(h*0.42)},{x:Math.round(w*0.90),y:Math.round(h*0.54)},{x:Math.round(w*0.80),y:Math.round(h*0.65)},{x:Math.round(w*0.50),y:Math.round(h*0.64)},{x:Math.round(w*0.18),y:Math.round(h*0.64)},{x:Math.round(w*0.08),y:Math.round(h*0.54)}]};}\n"
+    "function ensureCalibrationPoints(){if(!state.calibration.points||state.calibration.points.length!==8){state.calibration=makeDefaultCalibration(state.calibration.imageWidth||640,state.calibration.imageHeight||320);}}\n"
+    "function drawCalibrationCanvas(){const c=ui.calibrationCanvas,ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle='#f8fbf5';ctx.fillRect(0,0,c.width,c.height);if(state.calibrationImage){ctx.drawImage(state.calibrationImage,0,0,c.width,c.height);}ctx.strokeStyle='rgba(13,107,87,0.85)';ctx.lineWidth=3;ensureCalibrationPoints();ctx.beginPath();state.calibration.points.forEach((p,i)=>{if(i===0)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y);});ctx.closePath();ctx.stroke();if(state.hoverPos){ctx.save();ctx.strokeStyle='rgba(255,255,255,0.6)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(state.hoverPos.x,0);ctx.lineTo(state.hoverPos.x,c.height);ctx.moveTo(0,state.hoverPos.y);ctx.lineTo(c.width,state.hoverPos.y);ctx.stroke();ctx.restore();}ctx.font='12px sans-serif';state.calibration.points.forEach((p,i)=>{ctx.beginPath();ctx.fillStyle=i===state.selectedIndex?'#0d6b57':'#d26a2e';ctx.arc(p.x,p.y,i===state.selectedIndex?8:7,0,Math.PI*2);ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='rgba(255,255,255,0.9)';ctx.stroke();ctx.fillStyle='#132b21';ctx.fillText(POINT_LABELS[i],p.x+10,p.y-10);});drawMagnifier();}\n"
+    "function drawRectifiedGuide(){const c=ui.rectifiedCanvas,ctx=c.getContext('2d');const pad=40,w=c.width,h=c.height;const left=pad,right=w-pad,top=pad,bottom=h-pad,cx=Math.round((left+right)/2),cy=Math.round((top+bottom)/2);ctx.clearRect(0,0,w,h);ctx.fillStyle='#f8fbf5';ctx.fillRect(0,0,w,h);if(state.rectifiedImage){const img=state.rectifiedImage;const scale=Math.min(w/img.width,h/img.height);const dw=Math.round(img.width*scale),dh=Math.round(img.height*scale);const dx=Math.round((w-dw)/2),dy=Math.round((h-dh)/2);ctx.drawImage(img,dx,dy,dw,dh);ctx.strokeStyle='rgba(13,107,87,0.45)';ctx.lineWidth=2;ctx.strokeRect(dx,dy,dw,dh);ctx.fillStyle='#5b6b61';ctx.fillText('Rectified preview rendered by T23',pad,h-12);return;}ctx.strokeStyle='rgba(13,107,87,0.85)';ctx.lineWidth=3;ctx.strokeRect(left,top,right-left,bottom-top);const pts=[[left,top],[cx,top],[right,top],[right,cy],[right,bottom],[cx,bottom],[left,bottom],[left,cy]];ctx.font='12px sans-serif';pts.forEach((p,i)=>{ctx.beginPath();ctx.fillStyle='#0d6b57';ctx.arc(p[0],p[1],7,0,Math.PI*2);ctx.fill();ctx.fillStyle='#132b21';ctx.fillText(POINT_LABELS[i],p[0]+10,p[1]-10);});ctx.fillStyle='#5b6b61';ctx.fillText('Rectified preview will appear here after calibration confirm',pad,h-12);}\n"
     "function drawBorderBlocks(){const c=ui.borderCanvas,ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle='#101814';ctx.fillRect(0,0,c.width,c.height);if(!state.borderData){ctx.fillStyle='#cce7db';ctx.font='16px sans-serif';ctx.fillText('Border average preview will appear here',20,30);return;}const d=state.borderData,m=getLayoutMeta(d);const margin=16,outerW=c.width-margin*2,outerH=c.height-margin*2;const l=margin,t=margin,r=l+outerW,b=t+outerH;const topCell=Math.max(1,outerW/Math.max(1,m.top));const sideCell=Math.max(1,outerH/Math.max(1,m.right));const th=Math.max(8,Math.min(Math.round(Math.min(topCell,sideCell)*0.85),Math.round(Math.min(outerW,outerH)*0.42)));const innerTop=t+th,innerBottom=b-th,innerLeft=l+th,innerRight=r-th;let idx=0;for(let i=0;i<m.top&&idx<d.blocks.length;i++,idx++){const x0=Math.round(l+outerW*i/m.top),x1=Math.round(l+outerW*(i+1)/m.top);const c0=d.blocks[idx];ctx.fillStyle=`rgb(${c0.r},${c0.g},${c0.b})`;ctx.fillRect(x0,t,Math.max(1,x1-x0),th);}const rightStart=idx;if(m.layout==='4X3'&&m.right===3&&rightStart+1<d.blocks.length){const c0=d.blocks[rightStart+1];ctx.fillStyle=`rgb(${c0.r},${c0.g},${c0.b})`;ctx.fillRect(r-th,innerTop,th,Math.max(1,innerBottom-innerTop));idx+=m.right;}else{for(let i=0;i<m.right&&idx<d.blocks.length;i++,idx++){const y0=Math.round(innerTop+(innerBottom-innerTop)*i/m.right),y1=Math.round(innerTop+(innerBottom-innerTop)*(i+1)/m.right);const c0=d.blocks[idx];ctx.fillStyle=`rgb(${c0.r},${c0.g},${c0.b})`;ctx.fillRect(r-th,y0,th,Math.max(1,y1-y0));}}for(let i=0;i<m.bottom&&idx<d.blocks.length;i++,idx++){const x0=Math.round(l+outerW*(m.bottom-1-i)/m.bottom),x1=Math.round(l+outerW*(m.bottom-i)/m.bottom);const c0=d.blocks[idx];ctx.fillStyle=`rgb(${c0.r},${c0.g},${c0.b})`;ctx.fillRect(x0,b-th,Math.max(1,x1-x0),th);}const leftStart=idx;if(m.layout==='4X3'&&m.left===3&&leftStart+1<d.blocks.length){const c0=d.blocks[leftStart+1];ctx.fillStyle=`rgb(${c0.r},${c0.g},${c0.b})`;ctx.fillRect(l,innerTop,th,Math.max(1,innerBottom-innerTop));idx+=m.left;}else{for(let i=0;i<m.left&&idx<d.blocks.length;i++,idx++){const y0=Math.round(innerTop+(innerBottom-innerTop)*(m.left-1-i)/m.left),y1=Math.round(innerTop+(innerBottom-innerTop)*(m.left-i)/m.left);const c0=d.blocks[idx];ctx.fillStyle=`rgb(${c0.r},${c0.g},${c0.b})`;ctx.fillRect(l,y0,th,Math.max(1,y1-y0));}}ctx.fillStyle='#101814';ctx.fillRect(innerLeft,innerTop,Math.max(1,innerRight-innerLeft),Math.max(1,innerBottom-innerTop));ctx.strokeStyle='rgba(255,255,255,0.35)';ctx.lineWidth=2;ctx.strokeRect(l,t,Math.max(1,outerW),Math.max(1,outerH));ctx.fillStyle='#cce7db';ctx.font='12px sans-serif';ctx.fillText(`${m.total} block average colors (${m.layout}) rendered from T23 output`,16,c.height-12);}\n"
     "function canvasPos(evt){const rect=ui.calibrationCanvas.getBoundingClientRect();const sx=ui.calibrationCanvas.width/rect.width,sy=ui.calibrationCanvas.height/rect.height;return{x:(evt.clientX-rect.left)*sx,y:(evt.clientY-rect.top)*sy};}\n"
     "function pickPoint(pos){ensureCalibrationPoints();for(let i=0;i<state.calibration.points.length;i++){const p=state.calibration.points[i];const dx=p.x-pos.x,dy=p.y-pos.y;if((dx*dx+dy*dy)<=225)return i;}return -1;}\n"
     "function clamp(v,min,max){return Math.max(min,Math.min(max,v));}\n"
-    "function bindCalibrationCanvas(){ui.calibrationCanvas.onpointerdown=(evt)=>{const pos=canvasPos(evt);state.dragIndex=pickPoint(pos);if(state.dragIndex>=0){ui.calibrationCanvas.setPointerCapture(evt.pointerId);}};ui.calibrationCanvas.onpointermove=(evt)=>{if(state.dragIndex<0)return;const pos=canvasPos(evt);const maxX=state.calibration.imageWidth-1,maxY=state.calibration.imageHeight-1;state.calibration.points[state.dragIndex]={x:Math.round(clamp(pos.x,0,maxX)),y:Math.round(clamp(pos.y,0,maxY))};drawCalibrationCanvas();drawRectifiedGuide();};ui.calibrationCanvas.onpointerup=(evt)=>{state.dragIndex=-1;try{ui.calibrationCanvas.releasePointerCapture(evt.pointerId);}catch(_){};};ui.calibrationCanvas.onpointerleave=()=>{};}\n"
-    "async function loadCalibrationSnapshot(){setCalibrationStatus('Loading snapshot...','busy');try{const r=await fetch(`/api/snap?t=${Date.now()}`,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();const img=new Image();await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=URL.createObjectURL(blob);});state.calibrationImage=img;ui.calibrationCanvas.width=img.width;ui.calibrationCanvas.height=img.height;if(!state.calibration.points||state.calibration.imageWidth!==img.width||state.calibration.imageHeight!==img.height){state.calibration=makeDefaultCalibration(img.width,img.height);}drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus('Calibration snapshot ready','good');}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
+    "function getSymmetryCenterX(){const pts=state.calibration.points;return Math.round((pts[1].x+pts[5].x)/2);}\n"
+    "function applyHorizontalConstraint(){if(!state.horizontalLock)return;const pts=state.calibration.points;[[0,2],[7,3],[6,4]].forEach(([a,b])=>{const y=Math.round((pts[a].y+pts[b].y)/2);pts[a]={...pts[a],y:y};pts[b]={...pts[b],y:y};});}\n"
+    "function applySymmetryConstraint(){if(!state.symmetryLock)return;const pts=state.calibration.points;const maxX=state.calibration.imageWidth-1;const centerX=(pts[1].x+pts[5].x)/2;[[0,2],[7,3],[6,4]].forEach(([l,r])=>{const dist=0.5*((centerX-pts[l].x)+(pts[r].x-centerX));pts[l]={...pts[l],x:Math.round(clamp(centerX-dist,0,maxX))};pts[r]={...pts[r],x:Math.round(clamp(centerX+dist,0,maxX))};});}\n"
+    "function getCalibrationImageData(){if(!state.calibrationImage)return null;if(state.calibrationImageData)return state.calibrationImageData;const canvas=state.calibrationSampleCanvas||document.createElement('canvas');canvas.width=state.calibrationImage.width;canvas.height=state.calibrationImage.height;const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(state.calibrationImage,0,0,canvas.width,canvas.height);state.calibrationSampleCanvas=canvas;state.calibrationImageData=ctx.getImageData(0,0,canvas.width,canvas.height);return state.calibrationImageData;}\n"
+    "function getActiveCalibrationPos(){ensureCalibrationPoints();if(state.dragIndex>=0)return state.calibration.points[state.dragIndex];if(state.hoverPos)return state.hoverPos;if(state.selectedIndex>=0&&state.calibration.points[state.selectedIndex])return state.calibration.points[state.selectedIndex];return {x:state.calibration.imageWidth/2,y:state.calibration.imageHeight/2};}\n"
+    "function drawMagnifier(){const c=ui.magnifierCanvas,ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle='#101814';ctx.fillRect(0,0,c.width,c.height);if(!state.calibrationImage){ctx.fillStyle='#cce7db';ctx.font='14px sans-serif';ctx.fillText('Load calibration image',16,28);return;}const pos=getActiveCalibrationPos();const srcSize=24;const sx=clamp(Math.round(pos.x-srcSize/2),0,Math.max(0,state.calibrationImage.width-srcSize));const sy=clamp(Math.round(pos.y-srcSize/2),0,Math.max(0,state.calibrationImage.height-srcSize));ctx.imageSmoothingEnabled=false;ctx.drawImage(state.calibrationImage,sx,sy,srcSize,srcSize,0,0,c.width,c.height);ctx.imageSmoothingEnabled=true;ctx.strokeStyle='rgba(255,255,255,0.95)';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(c.width/2,0);ctx.lineTo(c.width/2,c.height);ctx.moveTo(0,c.height/2);ctx.lineTo(c.width,c.height/2);ctx.stroke();ctx.strokeStyle='rgba(13,107,87,0.95)';ctx.lineWidth=2.5;ctx.strokeRect(1,1,c.width-2,c.height-2);ctx.fillStyle='#cce7db';ctx.font='12px sans-serif';const label=state.selectedIndex>=0?POINT_LABELS[state.selectedIndex]:'Cursor';ctx.fillText(`${label}: ${Math.round(pos.x)}, ${Math.round(pos.y)}`,10,c.height-12);}\n"
+    "function sampleLuma(img,x,y){const w=img.width,h=img.height;const ix=clamp(x,0,w-1),iy=clamp(y,0,h-1);const idx=(iy*w+ix)*4;const d=img.data;return d[idx]*0.299+d[idx+1]*0.587+d[idx+2]*0.114;}\n"
+    "function edgeStrengthAt(img,x,y){const gx=-sampleLuma(img,x-1,y-1)-2*sampleLuma(img,x-1,y)-sampleLuma(img,x-1,y+1)+sampleLuma(img,x+1,y-1)+2*sampleLuma(img,x+1,y)+sampleLuma(img,x+1,y+1);const gy=-sampleLuma(img,x-1,y-1)-2*sampleLuma(img,x,y-1)-sampleLuma(img,x+1,y-1)+sampleLuma(img,x-1,y+1)+2*sampleLuma(img,x,y+1)+sampleLuma(img,x+1,y+1);return Math.abs(gx)+Math.abs(gy);}\n"
+    "function snapCalibrationPoint(index){const img=getCalibrationImageData();if(!img||index<0)return;const p=state.calibration.points[index];let bestX=p.x,bestY=p.y,bestScore=-1;const radius=8;for(let dy=-radius;dy<=radius;dy++){for(let dx=-radius;dx<=radius;dx++){const x=Math.round(clamp(p.x+dx,1,img.width-2));const y=Math.round(clamp(p.y+dy,1,img.height-2));const dist=Math.abs(dx)+Math.abs(dy);const score=edgeStrengthAt(img,x,y)-dist*10;if(score>bestScore){bestScore=score;bestX=x;bestY=y;}}}state.calibration.points[index]={x:bestX,y:bestY};}\n"
+    "function moveCalibrationPoint(index,dx,dy){if(index<0)return;const maxX=state.calibration.imageWidth-1,maxY=state.calibration.imageHeight-1;const p=state.calibration.points[index];state.calibration.points[index]={x:Math.round(clamp(p.x+dx,0,maxX)),y:Math.round(clamp(p.y+dy,0,maxY))};applyHorizontalConstraint();applySymmetryConstraint();drawCalibrationCanvas();drawRectifiedGuide();}\n"
+    "function updateHorizontalLockButton(){if(!ui.horizontalLockBtn)return;ui.horizontalLockBtn.textContent=`Horizontal Lock: ${state.horizontalLock?'On':'Off'}`;ui.horizontalLockBtn.classList.toggle('is-good',state.horizontalLock);}\n"
+    "function toggleHorizontalLock(){state.horizontalLock=!state.horizontalLock;applyHorizontalConstraint();applySymmetryConstraint();drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus(state.horizontalLock?'Horizontal lock enabled':'Horizontal lock disabled','good');updateHorizontalLockButton();}\n"
+    "function updateSymmetryLockButton(){if(!ui.symmetryLockBtn)return;ui.symmetryLockBtn.textContent=`Symmetry Lock: ${state.symmetryLock?'On':'Off'}`;ui.symmetryLockBtn.classList.toggle('is-good',state.symmetryLock);}\n"
+    "function toggleSymmetryLock(){state.symmetryLock=!state.symmetryLock;applyHorizontalConstraint();applySymmetryConstraint();drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus(state.symmetryLock?'Symmetry lock enabled':'Symmetry lock disabled','good');updateSymmetryLockButton();}\n"
+    "function bindCalibrationCanvas(){ui.calibrationCanvas.onpointerdown=(evt)=>{const pos=canvasPos(evt);state.hoverPos=pos;state.dragIndex=pickPoint(pos);if(state.dragIndex>=0){state.selectedIndex=state.dragIndex;ui.calibrationCanvas.setPointerCapture(evt.pointerId);}drawCalibrationCanvas();};ui.calibrationCanvas.onpointermove=(evt)=>{const pos=canvasPos(evt);state.hoverPos=pos;if(state.dragIndex<0){drawCalibrationCanvas();return;}const maxX=state.calibration.imageWidth-1,maxY=state.calibration.imageHeight-1;state.calibration.points[state.dragIndex]={x:Math.round(clamp(pos.x,0,maxX)),y:Math.round(clamp(pos.y,0,maxY))};applyHorizontalConstraint();applySymmetryConstraint();drawCalibrationCanvas();drawRectifiedGuide();};ui.calibrationCanvas.onpointerup=(evt)=>{state.dragIndex=-1;try{ui.calibrationCanvas.releasePointerCapture(evt.pointerId);}catch(_){};};ui.calibrationCanvas.onpointerleave=()=>{state.hoverPos=null;drawCalibrationCanvas();};window.addEventListener('keydown',(evt)=>{if(!ui.calibrationPanel||ui.calibrationPanel.classList.contains('is-hidden'))return;const active=['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'];if(!active.includes(evt.key))return;ensureCalibrationPoints();const step=evt.shiftKey?5:1;let dx=0,dy=0;if(evt.key==='ArrowLeft')dx=-step;else if(evt.key==='ArrowRight')dx=step;else if(evt.key==='ArrowUp')dy=-step;else if(evt.key==='ArrowDown')dy=step;evt.preventDefault();moveCalibrationPoint(state.selectedIndex,dx,dy);});}\n"
+    "async function loadCalibrationSnapshot(){setCalibrationStatus('Loading calibration image...','busy');try{const r=await fetch(`/api/calibration/snapshot?t=${Date.now()}`,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();const img=new Image();await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=URL.createObjectURL(blob);});state.calibrationImage=img;state.calibrationImageData=null;state.calibrationSampleCanvas=null;ui.calibrationCanvas.width=img.width;ui.calibrationCanvas.height=img.height;if(!state.calibration.points||state.calibration.imageWidth!==img.width||state.calibration.imageHeight!==img.height){state.calibration=makeDefaultCalibration(img.width,img.height);}drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus('Calibration image ready','good');}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function loadRectifiedPreview(){setCalibrationStatus('Loading rectified preview...','busy');log(`GET /api/calibration/rectified?t=${Date.now()}`);try{const r=await fetch(`/api/calibration/rectified?t=${Date.now()}`,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();const img=new Image();await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=URL.createObjectURL(blob);});state.rectifiedImage=img;drawRectifiedGuide();setCalibrationStatus('Rectified preview updated','good');}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
-    "async function loadCalibration(){setCalibrationStatus('Loading saved points...','busy');log('GET /api/calibration');try{const data=await fetchJson('/api/calibration');state.calibration={imageWidth:data.imageWidth,imageHeight:data.imageHeight,points:data.points};if(!state.calibrationImage)await loadCalibrationSnapshot();else{ui.calibrationCanvas.width=state.calibration.imageWidth;ui.calibrationCanvas.height=state.calibration.imageHeight;drawCalibrationCanvas();drawRectifiedGuide();}await loadRectifiedPreview();}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
-    "function resetCalibration(){const w=(state.calibrationImage&&state.calibrationImage.width)||state.calibration.imageWidth||640;const h=(state.calibrationImage&&state.calibrationImage.height)||state.calibration.imageHeight||320;state.calibration=makeDefaultCalibration(w,h);state.rectifiedImage=null;drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus('Calibration points reset','good');}\n"
-    "async function saveCalibration(){ensureCalibrationPoints();const q=new URLSearchParams();q.set('iw',state.calibration.imageWidth);q.set('ih',state.calibration.imageHeight);state.calibration.points.forEach((p,i)=>{q.set(`x${i}`,p.x);q.set(`y${i}`,p.y);});const url=`/api/calibration/set?${q.toString()}`;setCalibrationStatus('Saving calibration...','busy');log(`GET ${url}`);try{const data=await fetchJson(url);state.calibration={imageWidth:data.imageWidth,imageHeight:data.imageHeight,points:data.points};drawCalibrationCanvas();state.rectifiedImage=null;drawRectifiedGuide();await loadRectifiedPreview();}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function loadCalibration(){setCalibrationStatus('Loading saved points...','busy');log('GET /api/calibration');try{const data=await fetchJson('/api/calibration');state.calibration={imageWidth:data.imageWidth,imageHeight:data.imageHeight,points:data.points};applyHorizontalConstraint();applySymmetryConstraint();if(!state.calibrationImage)await loadCalibrationSnapshot();else{ui.calibrationCanvas.width=state.calibration.imageWidth;ui.calibrationCanvas.height=state.calibration.imageHeight;drawCalibrationCanvas();drawRectifiedGuide();}await loadRectifiedPreview();}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
+    "function resetCalibration(){const w=(state.calibrationImage&&state.calibrationImage.width)||state.calibration.imageWidth||640;const h=(state.calibrationImage&&state.calibrationImage.height)||state.calibration.imageHeight||320;state.calibration=makeDefaultCalibration(w,h);applyHorizontalConstraint();applySymmetryConstraint();state.rectifiedImage=null;drawCalibrationCanvas();drawRectifiedGuide();setCalibrationStatus('Calibration points reset','good');}\n"
+    "function buildCalibrationQuery(){ensureCalibrationPoints();applyHorizontalConstraint();applySymmetryConstraint();const q=new URLSearchParams();q.set('iw',state.calibration.imageWidth);q.set('ih',state.calibration.imageHeight);state.calibration.points.forEach((p,i)=>{q.set(`x${i}`,p.x);q.set(`y${i}`,p.y);});return q;}\n"
+    "function formatLensK1(v){return (Number(v||0)/1000000).toFixed(6);}\n"
+    "function formatLensFloat(v,s=3){return Number(v||0).toFixed(s);}\n"
+    "function applyLensProfile(data){if(!data)return;state.lens=data;const parts=[`fx ${formatLensFloat(data.fx,3)}`,`fy ${formatLensFloat(data.fy,3)}`,`cx ${formatLensFloat(data.cx,3)}`,`cy ${formatLensFloat(data.cy,3)}`,`k1 ${formatLensK1(data.k1Scaled)}`,`k2 ${formatLensK1(data.k2Scaled)}`,`scale ${formatLensFloat(data.knewScale,3)}x`];setLensStatus(`Lens preset active: ${parts.join(' | ')}`,'good');}\n"
+    "async function refreshLensProfile(){log('GET /api/lens_profile');try{const data=await fetchJson('/api/lens_profile');applyLensProfile(data);}catch(e){log(`ERR ${e.message}`);setLensStatus(`ERR ${e.message}`,'bad');}}\n"
+    "async function saveCalibration(){const q=buildCalibrationQuery();const url=`/api/calibration/set?${q.toString()}`;setCalibrationStatus('Saving calibration...','busy');log(`GET ${url}`);try{const data=await fetchJson(url);state.calibration={imageWidth:data.imageWidth,imageHeight:data.imageHeight,points:data.points};applyHorizontalConstraint();applySymmetryConstraint();drawCalibrationCanvas();state.rectifiedImage=null;drawRectifiedGuide();await loadRectifiedPreview();}catch(e){log(`ERR ${e.message}`);setCalibrationStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function fetchJson(url){const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json();}\n"
     "async function refreshWiFiStatus(){log('GET /api/wifi');try{const data=await fetchJson('/api/wifi');applyWifiStatus(data);}catch(e){log(`ERR ${e.message}`);if(ui.wifiStatusBadge){ui.wifiStatusBadge.textContent=`ERR ${e.message}`;ui.wifiStatusBadge.classList.remove('is-good','is-busy');ui.wifiStatusBadge.classList.add('is-bad');}}}\n"
     "async function scanWiFi(){log('GET /api/wifi/scan');try{const data=await fetchJson('/api/wifi/scan');applyWifiScan(data);setPreviewStatus('WiFi scan complete','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
@@ -1339,9 +1405,12 @@ static const char g_app_js[] =
     "async function refreshBorderBlocks(){log('GET /api/border_blocks');try{state.borderData=await fetchJson('/api/border_blocks');applyLayoutMeta(state.borderData);state.lastBlocksAt=Date.now();drawBorderBlocks();}catch(e){log(`ERR ${e.message}`);}}\n"
     "async function refreshRuntimeBlocks(){if(state.runtimeBusy)return;state.runtimeBusy=true;log('GET /api/runtime_blocks');try{state.borderData=await fetchJson('/api/runtime_blocks');applyLayoutMeta(state.borderData);drawBorderBlocks();setPreviewStatus('Run mode blocks updated','good');}catch(e){log(`ERR ${e.message}`);if(String(e.message).includes('HTTP 500'))setPreviewStatus('Run mode warming up...','busy');else setPreviewStatus(`ERR ${e.message}`,'bad');}finally{state.runtimeBusy=false;}}\n"
     "async function captureSnapshot(){if(state.previewBusy)return false;state.previewBusy=true;setPreviewStatus('Capturing snapshot...','busy');const url=`/api/snap?t=${Date.now()}`;log(`GET ${url}`);try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();if(state.previewUrl)URL.revokeObjectURL(state.previewUrl);state.previewUrl=URL.createObjectURL(blob);ui.previewImage.src=state.previewUrl;await waitForImage(ui.previewImage);setPreviewStatus('Preview updated','good');return true;}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');return false;}finally{state.previewBusy=false;}}\n"
+    "function makeSnapshotFilename(){const d=new Date();const p=n=>String(n).padStart(2,'0');return `t23_snapshot_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.jpg`;}\n"
+    "async function saveSnapshotToLocal(){if(state.mode==='RUN'){setPreviewStatus('Run mode does not provide web preview snapshots','bad');return;}if(!state.previewUrl){const ok=await captureSnapshot();if(!ok)return;}const a=document.createElement('a');a.href=state.previewUrl;a.download=makeSnapshotFilename();document.body.appendChild(a);a.click();a.remove();setPreviewStatus('Snapshot saved to local download folder','good');}\n"
+    "async function saveHiResSnapshotToLocal(){if(state.mode==='RUN'){setPreviewStatus('Run mode does not provide web preview snapshots','bad');return;}setPreviewStatus('Capturing hi-res snapshot...','busy');const url=`/api/snap_hires?t=${Date.now()}`;log(`GET ${url}`);try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const blob=await r.blob();const href=URL.createObjectURL(blob);const a=document.createElement('a');a.href=href;a.download=makeSnapshotFilename().replace('t23_snapshot_','t23_snapshot_hires_');document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(href),1000);setPreviewStatus('Hi-res snapshot saved to local download folder','good');}catch(e){log(`ERR ${e.message}`);setPreviewStatus(`ERR ${e.message}`,'bad');}}\n"
     "async function refreshPreviewAndBlocks(){const ok=await captureSnapshot();if(ok)await refreshBorderBlocks();}\n"
     "function startAutoPreview(){if(state.mode==='RUN'){setPreviewStatus('Run mode disables web preview for lowest latency','good');return;}if(state.autoPreviewTimer){clearInterval(state.autoPreviewTimer);state.autoPreviewTimer=null;ui.autoPreviewBtn.textContent='Start Auto Preview';setPreviewStatus('Auto preview stopped');return;}const runner=refreshPreviewAndBlocks;runner();state.autoPreviewTimer=setInterval(()=>runner(),280);ui.autoPreviewBtn.textContent='Stop Auto Preview';setPreviewStatus('Auto preview running','good');}\n"
-    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.wifiScanSelect.onchange=()=>{if(ui.wifiScanSelect.value)ui.wifiSsidInput.value=ui.wifiScanSelect.value;};ui.wifiScanBtn.onclick=scanWiFi;ui.wifiSaveBtn.onclick=saveWiFi;ui.wifiForgetBtn.onclick=forgetWiFi;ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.stripProfileSelect.onchange=()=>setStripProfile(ui.stripProfileSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.colorOrderSelect.onchange=()=>setColorOrder(ui.colorOrderSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.saveParamsBtn.onclick=saveStartupParams;ui.ledCalSaveBtn.onclick=saveLedCal;ui.ledTestWhiteBtn.onclick=()=>setLedTest('WHITE');ui.ledTestRedBtn.onclick=()=>setLedTest('RED');ui.ledTestGreenBtn.onclick=()=>setLedTest('GREEN');ui.ledTestBlueBtn.onclick=()=>setLedTest('BLUE');ui.ledTestCyanBtn.onclick=()=>setLedTest('CYAN');ui.ledTestMagentaBtn.onclick=()=>setLedTest('MAGENTA');ui.ledTestYellowBtn.onclick=()=>setLedTest('YELLOW');ui.ledTestLiveBtn.onclick=()=>setLedTest('LIVE');ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;renderParams();renderLedCal();bindCalibrationCanvas();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(refreshLedCal).then(refreshWiFiStatus).then(scanWiFi).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});setInterval(()=>refreshWiFiStatus(),5000);\n";
+    "ui.snapBtn.onclick=refreshPreviewAndBlocks;ui.saveSnapBtn.onclick=saveSnapshotToLocal;ui.saveHiResSnapBtn.onclick=saveHiResSnapshotToLocal;ui.autoPreviewBtn.onclick=startAutoPreview;ui.enterRunBtn.onclick=()=>setMode('RUN');ui.returnDebugBtn.onclick=()=>setMode('DEBUG');ui.wifiScanSelect.onchange=()=>{if(ui.wifiScanSelect.value)ui.wifiSsidInput.value=ui.wifiScanSelect.value;};ui.wifiScanBtn.onclick=scanWiFi;ui.wifiSaveBtn.onclick=saveWiFi;ui.wifiForgetBtn.onclick=forgetWiFi;ui.layoutSelect.onchange=()=>setLayout(ui.layoutSelect.value);ui.stripProfileSelect.onchange=()=>setStripProfile(ui.stripProfileSelect.value);ui.installModeSelect.onchange=()=>setInstallMode(ui.installModeSelect.value);ui.colorOrderSelect.onchange=()=>setColorOrder(ui.colorOrderSelect.value);ui.showInstallGuideBtn.onclick=toggleInstallGuide;ui.saveParamsBtn.onclick=saveStartupParams;ui.restoreDefaultBtn.onclick=restoreDefaultParams;ui.restoreSavedBtn.onclick=restoreSavedParams;ui.ledCalSaveBtn.onclick=saveLedCal;ui.ledTestWhiteBtn.onclick=()=>setLedTest('WHITE');ui.ledTestRedBtn.onclick=()=>setLedTest('RED');ui.ledTestGreenBtn.onclick=()=>setLedTest('GREEN');ui.ledTestBlueBtn.onclick=()=>setLedTest('BLUE');ui.ledTestCyanBtn.onclick=()=>setLedTest('CYAN');ui.ledTestMagentaBtn.onclick=()=>setLedTest('MAGENTA');ui.ledTestYellowBtn.onclick=()=>setLedTest('YELLOW');ui.ledTestLiveBtn.onclick=()=>setLedTest('LIVE');ui.clearLogBtn.onclick=()=>{ui.logBox.textContent='';};ui.updateLensBtn.onclick=refreshLensProfile;ui.loadCalibrationSnapBtn.onclick=loadCalibrationSnapshot;ui.resetCalibrationBtn.onclick=resetCalibration;ui.saveCalibrationBtn.onclick=saveCalibration;ui.horizontalLockBtn.onclick=toggleHorizontalLock;ui.symmetryLockBtn.onclick=toggleSymmetryLock;renderParams();renderLedCal();bindCalibrationCanvas();updateHorizontalLockButton();updateSymmetryLockButton();resetCalibration();drawRectifiedGuide();drawBorderBlocks();refreshMode().then(refreshLayout).then(refreshInstallMode).then(refreshLedCal).then(refreshLensProfile).then(refreshWiFiStatus).then(scanWiFi).then(()=>state.mode==='RUN'?refreshRuntimeBlocks():refreshValues().then(refreshPreviewAndBlocks).then(loadCalibration)).catch(()=>{});setInterval(()=>refreshWiFiStatus(),5000);\n";
 
 static void post_setup_cb(spi_slave_transaction_t *trans)
 {
@@ -1888,17 +1957,38 @@ static esp_err_t bridge_set_param(const char *key, int value, char *json_buf, si
     }
 }
 
-static esp_err_t apply_saved_isp_params_to_t23(void)
+static esp_err_t capture_current_isp_params_to_slot(saved_isp_params_t *slot, int *valid_flag)
+{
+    int values[sizeof(g_params) / sizeof(g_params[0])] = {0};
+    int have_value[sizeof(g_params) / sizeof(g_params[0])] = {0};
+    size_t i;
+    esp_err_t ret = bridge_get_all_values(values, have_value);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->magic = ISP_SAVE_MAGIC;
+
+    for (i = 0; i < sizeof(g_params) / sizeof(g_params[0]); ++i) {
+        slot->values[i] = have_value[i] ? values[i] : 0;
+    }
+    *valid_flag = 1;
+    return ESP_OK;
+}
+
+static esp_err_t apply_isp_params_to_t23(const saved_isp_params_t *params)
 {
     char json[96];
     size_t i;
 
-    if (!g_saved_isp_params_valid) {
+    if (params == NULL || params->magic != ISP_SAVE_MAGIC) {
         return ESP_OK;
     }
 
     for (i = 0; i < sizeof(g_params) / sizeof(g_params[0]); ++i) {
-        esp_err_t ret = bridge_set_param(g_params[i].name, (int)g_saved_isp_params.values[i], json, sizeof(json));
+        esp_err_t ret = bridge_set_param(g_params[i].name, (int)params->values[i], json, sizeof(json));
 
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "failed to apply saved ISP param %s", g_params[i].name);
@@ -1910,24 +2000,79 @@ static esp_err_t apply_saved_isp_params_to_t23(void)
     return ESP_OK;
 }
 
+static esp_err_t apply_saved_isp_params_to_t23(void)
+{
+    if (!g_saved_isp_params_valid) {
+        return ESP_OK;
+    }
+    return apply_isp_params_to_t23(&g_saved_isp_params);
+}
+
+static esp_err_t bridge_get_lens_status(int *valid_out,
+                                        int32_t *fx_scaled_out,
+                                        int32_t *fy_scaled_out,
+                                        int32_t *cx_scaled_out,
+                                        int32_t *cy_scaled_out,
+                                        int32_t *k1_scaled_out,
+                                        int32_t *k2_scaled_out,
+                                        int32_t *knew_scaled_out)
+{
+    char line[UART_LINE_MAX];
+    int valid = 0;
+    int32_t fx_scaled = 0;
+    int32_t fy_scaled = 0;
+    int32_t cx_scaled = 0;
+    int32_t cy_scaled = 0;
+    int32_t k1_scaled = 0;
+    int32_t k2_scaled = 0;
+    int32_t knew_scaled = 0;
+    int len;
+
+    uart_flush_rx();
+    ESP_ERROR_CHECK(uart_send_line("LENS GET"));
+
+    while (1) {
+        len = uart_read_line(line, sizeof(line), 1500);
+        if (len <= 0) {
+            ESP_LOGW(TAG, "LENS GET timeout waiting for UART response");
+            return ESP_ERR_TIMEOUT;
+        }
+        if (sscanf(line,
+                   "LENS PRESET %d %" SCNd32 " %" SCNd32 " %" SCNd32 " %" SCNd32 " %" SCNd32 " %" SCNd32 " %" SCNd32,
+                   &valid,
+                   &fx_scaled,
+                   &fy_scaled,
+                   &cx_scaled,
+                   &cy_scaled,
+                   &k1_scaled,
+                   &k2_scaled,
+                   &knew_scaled) == 8) {
+            continue;
+        }
+        if (strcmp(line, "OK LENS GET") == 0) {
+            *valid_out = valid ? 1 : 0;
+            *fx_scaled_out = fx_scaled;
+            *fy_scaled_out = fy_scaled;
+            *cx_scaled_out = cx_scaled;
+            *cy_scaled_out = cy_scaled;
+            *k1_scaled_out = k1_scaled;
+            *k2_scaled_out = k2_scaled;
+            *knew_scaled_out = knew_scaled;
+            return ESP_OK;
+        }
+        if (strncmp(line, "ERR ", 4) == 0) {
+            return ESP_FAIL;
+        }
+    }
+}
+
 static esp_err_t capture_and_save_current_isp_params(char *json_buf, size_t json_buf_size)
 {
-    int values[sizeof(g_params) / sizeof(g_params[0])] = {0};
-    int have_value[sizeof(g_params) / sizeof(g_params[0])] = {0};
-    size_t i;
-    esp_err_t ret = bridge_get_all_values(values, have_value);
+    esp_err_t ret = capture_current_isp_params_to_slot(&g_saved_isp_params, &g_saved_isp_params_valid);
 
     if (ret != ESP_OK) {
         return ret;
     }
-
-    memset(&g_saved_isp_params, 0, sizeof(g_saved_isp_params));
-    g_saved_isp_params.magic = ISP_SAVE_MAGIC;
-
-    for (i = 0; i < sizeof(g_params) / sizeof(g_params[0]); ++i) {
-        g_saved_isp_params.values[i] = have_value[i] ? values[i] : 0;
-    }
-    g_saved_isp_params_valid = 1;
 
     ret = save_saved_isp_params();
     if (ret != ESP_OK) {
@@ -2551,9 +2696,19 @@ static esp_err_t bridge_fetch_snapshot_locked(uint8_t *jpeg_buf, size_t jpeg_buf
     return bridge_fetch_snapshot_locked_ex("SNAP", "SNAP OK %" SCNu32, jpeg_buf, jpeg_buf_size, jpeg_len_out);
 }
 
+static esp_err_t bridge_fetch_hires_snapshot_locked(uint8_t *jpeg_buf, size_t jpeg_buf_size, size_t *jpeg_len_out)
+{
+    return bridge_fetch_snapshot_locked_ex("SNAP HIRES", "SNAP HIRES OK %" SCNu32, jpeg_buf, jpeg_buf_size, jpeg_len_out);
+}
+
 static esp_err_t bridge_fetch_rectified_locked(uint8_t *jpeg_buf, size_t jpeg_buf_size, size_t *jpeg_len_out)
 {
     return bridge_fetch_snapshot_locked_ex("CAL SNAP", "CAL SNAP OK %" SCNu32, jpeg_buf, jpeg_buf_size, jpeg_len_out);
+}
+
+static esp_err_t bridge_fetch_calibration_snapshot_locked(uint8_t *jpeg_buf, size_t jpeg_buf_size, size_t *jpeg_len_out)
+{
+    return bridge_fetch_snapshot_locked_ex("SNAP", "SNAP OK %" SCNu32, jpeg_buf, jpeg_buf_size, jpeg_len_out);
 }
 
 static size_t choose_preview_capacity(void)
@@ -2644,6 +2799,30 @@ static esp_err_t bridge_stream_snapshot(httpd_req_t *req)
     return httpd_resp_send(req, (const char *)g_latest_jpeg, jpeg_len);
 }
 
+static esp_err_t bridge_stream_snapshot_hires(httpd_req_t *req)
+{
+    uint8_t *jpeg_buf = NULL;
+    size_t jpeg_len = 0;
+    esp_err_t ret;
+
+    jpeg_buf = malloc(HIRES_JPEG_MAX_SIZE);
+    if (jpeg_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ret = bridge_fetch_hires_snapshot_locked(jpeg_buf, HIRES_JPEG_MAX_SIZE, &jpeg_len);
+    if (ret == ESP_OK && jpeg_len > 0) {
+        set_common_headers(req);
+        httpd_resp_set_type(req, "image/jpeg");
+        ret = httpd_resp_send(req, (const char *)jpeg_buf, jpeg_len);
+    } else {
+        ret = ESP_FAIL;
+    }
+
+    free(jpeg_buf);
+    return ret;
+}
+
 static esp_err_t bridge_stream_rectified(httpd_req_t *req)
 {
     size_t jpeg_len = 0;
@@ -2654,6 +2833,25 @@ static esp_err_t bridge_stream_rectified(httpd_req_t *req)
     }
 
     ret = bridge_fetch_rectified_locked(g_latest_jpeg, g_latest_jpeg_capacity, &jpeg_len);
+    if (ret != ESP_OK || jpeg_len == 0) {
+        return ESP_FAIL;
+    }
+
+    set_common_headers(req);
+    httpd_resp_set_type(req, "image/jpeg");
+    return httpd_resp_send(req, (const char *)g_latest_jpeg, jpeg_len);
+}
+
+static esp_err_t bridge_stream_calibration_snapshot(httpd_req_t *req)
+{
+    size_t jpeg_len = 0;
+    esp_err_t ret;
+
+    if (g_latest_jpeg == NULL || g_latest_jpeg_capacity == 0) {
+        return ESP_FAIL;
+    }
+
+    ret = bridge_fetch_calibration_snapshot_locked(g_latest_jpeg, g_latest_jpeg_capacity, &jpeg_len);
     if (ret != ESP_OK || jpeg_len == 0) {
         return ESP_FAIL;
     }
@@ -3232,6 +3430,50 @@ static esp_err_t params_save_handler(httpd_req_t *req)
     return send_json(req, json);
 }
 
+static esp_err_t params_restore_default_handler(httpd_req_t *req)
+{
+    char json[512];
+    esp_err_t ret;
+
+    if (!g_default_isp_params_valid) {
+        return send_error_json(req, "default params not captured yet", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
+    ret = apply_isp_params_to_t23(&g_default_isp_params);
+    if (ret == ESP_OK) {
+        ret = bridge_get_all(json, sizeof(json));
+    }
+    xSemaphoreGive(g_bridge_lock);
+
+    if (ret != ESP_OK) {
+        return send_error_json(req, "restore default params failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    return send_json(req, json);
+}
+
+static esp_err_t params_restore_saved_handler(httpd_req_t *req)
+{
+    char json[512];
+    esp_err_t ret;
+
+    if (!g_saved_isp_params_valid) {
+        return send_error_json(req, "saved startup params not found", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
+    ret = apply_isp_params_to_t23(&g_saved_isp_params);
+    if (ret == ESP_OK) {
+        ret = bridge_get_all(json, sizeof(json));
+    }
+    xSemaphoreGive(g_bridge_lock);
+
+    if (ret != ESP_OK) {
+        return send_error_json(req, "restore saved params failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    return send_json(req, json);
+}
+
 static esp_err_t set_handler(httpd_req_t *req)
 {
     char query[128];
@@ -3284,6 +3526,20 @@ static esp_err_t snap_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t snap_hires_handler(httpd_req_t *req)
+{
+    esp_err_t ret;
+
+    xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
+    ret = bridge_stream_snapshot_hires(req);
+    xSemaphoreGive(g_bridge_lock);
+
+    if (ret != ESP_OK) {
+        return send_error_json(req, "hires snap failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    return ESP_OK;
+}
+
 static esp_err_t calibration_get_handler(httpd_req_t *req)
 {
     esp_err_t ret;
@@ -3332,6 +3588,61 @@ static esp_err_t calibration_rectified_handler(httpd_req_t *req)
         return send_error_json(req, "calibration rectified failed", HTTPD_500_INTERNAL_SERVER_ERROR);
     }
     return ESP_OK;
+}
+
+static esp_err_t calibration_snapshot_handler(httpd_req_t *req)
+{
+    esp_err_t ret;
+
+    xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
+    ret = bridge_stream_calibration_snapshot(req);
+    xSemaphoreGive(g_bridge_lock);
+
+    if (ret != ESP_OK) {
+        return send_error_json(req, "calibration snapshot failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t lens_profile_get_handler(httpd_req_t *req)
+{
+    char json[320];
+    int valid = 0;
+    int32_t fx_scaled = 0;
+    int32_t fy_scaled = 0;
+    int32_t cx_scaled = 0;
+    int32_t cy_scaled = 0;
+    int32_t k1_scaled = 0;
+    int32_t k2_scaled = 0;
+    int32_t knew_scaled = 0;
+    esp_err_t ret;
+
+    xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
+    ret = bridge_get_lens_status(&valid,
+                                 &fx_scaled,
+                                 &fy_scaled,
+                                 &cx_scaled,
+                                 &cy_scaled,
+                                 &k1_scaled,
+                                 &k2_scaled,
+                                 &knew_scaled);
+    xSemaphoreGive(g_bridge_lock);
+    if (ret != ESP_OK) {
+        return send_error_json(req, "lens profile get failed", HTTPD_500_INTERNAL_SERVER_ERROR);
+    }
+
+    snprintf(json,
+             sizeof(json),
+             "{\"ok\":true,\"deviceValid\":%s,\"fx\":%.3f,\"fy\":%.3f,\"cx\":%.3f,\"cy\":%.3f,\"k1Scaled\":%" PRId32 ",\"k2Scaled\":%" PRId32 ",\"knewScale\":%.3f}",
+             valid ? "true" : "false",
+             (double)fx_scaled / 1000.0,
+             (double)fy_scaled / 1000.0,
+             (double)cx_scaled / 1000.0,
+             (double)cy_scaled / 1000.0,
+             k1_scaled,
+             k2_scaled,
+             (double)knew_scaled / 1000.0);
+    return send_json(req, json);
 }
 
 static esp_err_t border_blocks_handler(httpd_req_t *req)
@@ -3505,6 +3816,18 @@ static esp_err_t start_http_server(void)
         .handler = params_save_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t params_restore_default = {
+        .uri = "/api/params/restore_default",
+        .method = HTTP_GET,
+        .handler = params_restore_default_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t params_restore_saved = {
+        .uri = "/api/params/restore_saved",
+        .method = HTTP_GET,
+        .handler = params_restore_saved_handler,
+        .user_ctx = NULL,
+    };
     httpd_uri_t set = {
         .uri = "/api/set",
         .method = HTTP_GET,
@@ -3515,6 +3838,12 @@ static esp_err_t start_http_server(void)
         .uri = "/api/snap",
         .method = HTTP_GET,
         .handler = snap_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t snap_hires = {
+        .uri = "/api/snap_hires",
+        .method = HTTP_GET,
+        .handler = snap_hires_handler,
         .user_ctx = NULL,
     };
     httpd_uri_t mode_get = {
@@ -3541,10 +3870,22 @@ static esp_err_t start_http_server(void)
         .handler = calibration_set_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t calibration_snapshot = {
+        .uri = "/api/calibration/snapshot",
+        .method = HTTP_GET,
+        .handler = calibration_snapshot_handler,
+        .user_ctx = NULL,
+    };
     httpd_uri_t calibration_rectified = {
         .uri = "/api/calibration/rectified",
         .method = HTTP_GET,
         .handler = calibration_rectified_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t lens_profile_get = {
+        .uri = "/api/lens_profile",
+        .method = HTTP_GET,
+        .handler = lens_profile_get_handler,
         .user_ctx = NULL,
     };
     httpd_uri_t border_blocks = {
@@ -3560,7 +3901,7 @@ static esp_err_t start_http_server(void)
         .user_ctx = NULL,
     };
     config.stack_size = 10240;
-    config.max_uri_handlers = 32;
+    config.max_uri_handlers = 60;
 
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
@@ -3584,13 +3925,18 @@ static esp_err_t start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_forget));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &params));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &params_save));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &params_restore_default));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &params_restore_saved));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &snap));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &snap_hires));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mode_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mode_set));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &calibration_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &calibration_set));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &calibration_snapshot));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &calibration_rectified));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &lens_profile_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &border_blocks));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &runtime_blocks));
 
@@ -3603,17 +3949,24 @@ static void boot_isp_sync_task(void *arg)
     int attempt;
 
     (void)arg;
-    if (!g_saved_isp_params_valid) {
-        vTaskDelete(NULL);
-        return;
-    }
-
     for (attempt = 0; attempt < 10; ++attempt) {
         esp_err_t ret;
 
         vTaskDelay(pdMS_TO_TICKS(1000));
         xSemaphoreTake(g_bridge_lock, portMAX_DELAY);
-        ret = apply_saved_isp_params_to_t23();
+        ret = ESP_OK;
+        if (!g_default_isp_params_valid) {
+            ret = capture_current_isp_params_to_slot(&g_default_isp_params, &g_default_isp_params_valid);
+            if (ret == ESP_OK) {
+                ret = save_default_isp_params();
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "captured T23 default ISP params");
+                }
+            }
+        }
+        if (ret == ESP_OK && g_saved_isp_params_valid) {
+            ret = apply_saved_isp_params_to_t23();
+        }
         xSemaphoreGive(g_bridge_lock);
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "boot ISP sync complete");
@@ -3734,6 +4087,7 @@ void app_main(void)
     load_install_config();
     load_wifi_config();
     load_saved_isp_params();
+    load_default_isp_params();
     load_led_color_calibration();
 
     g_bridge_lock = xSemaphoreCreateMutex();
