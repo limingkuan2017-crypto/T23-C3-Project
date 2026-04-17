@@ -5,6 +5,11 @@ PC-side tuning tools for the T23 rebuild project.
 ## Current tool
 
 - `web_serial_isp_tuner/`
+- `python_calibration/`
+
+`python_calibration/` is the Git-tracked mirror of the Windows-side Python
+calibration folder, including calibration scripts, test images, image zip, and
+the current fisheye calibration cache.
 
 This is a browser-based ISP tuning UI that uses the Web Serial API.
 
