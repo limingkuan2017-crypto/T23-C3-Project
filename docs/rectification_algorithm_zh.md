@@ -11,9 +11,9 @@
 
 当前实现对应的主要代码：
 
-- [T23 校正主实现](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
-- [C3 网页交互与桥接](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
-- [共享 8 点数据结构](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_border_pipeline.h)
+- [T23 校正主实现](/home/kuan/T23-C3-Project/t23_firmware/app/isp_bridge/src/main.c)
+- [C3 网页交互与桥接](/home/kuan/T23-C3-Project/c3_firmware/main/main.c)
+- [共享 8 点数据结构](/home/kuan/T23-C3-Project/shared/include/t23_border_pipeline.h)
 
 ## 2. 当前算法结论
 
@@ -32,7 +32,7 @@
 
 ## 3. 8 点数据模型
 
-当前共享点位定义在 [t23_border_pipeline.h](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_border_pipeline.h)：
+当前共享点位定义在 [t23_border_pipeline.h](/home/kuan/T23-C3-Project/shared/include/t23_border_pipeline.h)：
 
 - `TL` 左上角
 - `TM` 上边中点

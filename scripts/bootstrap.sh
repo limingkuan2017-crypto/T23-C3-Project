@@ -52,20 +52,20 @@ run_check() {
 run_build_t23() {
     echo
     echo "[2/4] building T23 diagnostics"
-    (cd "$REPO_ROOT/t23_rebuild" && ./scripts/build_camera.sh)
-    (cd "$REPO_ROOT/t23_rebuild/app/spi_diag" && make clean all)
+    (cd "$REPO_ROOT/t23_firmware" && ./scripts/build_camera.sh)
+    (cd "$REPO_ROOT/t23_firmware/app/spi_diag" && make clean all)
 }
 
 run_package_t23() {
     echo
     echo "[3/4] packaging T23 flash image"
-    (cd "$REPO_ROOT/t23_rebuild" && ./scripts/package_flash_image.sh)
+    (cd "$REPO_ROOT/t23_firmware" && ./scripts/package_flash_image.sh)
 }
 
 run_build_c3() {
     echo
     echo "[4/4] building ESP32-C3 firmware"
-    (cd "$REPO_ROOT/c3_rebuild" && ./scripts/idf_build.sh)
+    (cd "$REPO_ROOT/c3_firmware" && ./scripts/idf_build.sh)
 }
 
 if [ $# -eq 0 ]; then

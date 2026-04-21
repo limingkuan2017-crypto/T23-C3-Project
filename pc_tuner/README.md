@@ -1,6 +1,6 @@
 # pc_tuner
 
-PC-side tuning tools for the T23 rebuild project.
+PC-side tuning tools for the T23/C3 firmware project.
 
 ## Current tool
 

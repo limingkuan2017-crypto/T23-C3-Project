@@ -7,10 +7,10 @@
 1. [项目总指南](/home/kuan/T23-C3-Project/docs/project_guide_zh.md)
 2. [校正算法详解](/home/kuan/T23-C3-Project/docs/rectification_algorithm_zh.md)
 3. [Python/T23 算法同步说明](/home/kuan/T23-C3-Project/docs/python_rectification_sync_zh.md)
-4. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_rebuild/init/app_main.sh)
-5. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_rebuild/app/isp_bridge/src/main.c)
-6. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_rebuild/main/main.c)
-7. [共享协议头](/home/kuan/T23-C3-Project/t23_c3_shared/include/t23_c3_protocol.h)
+4. [T23 启动入口脚本](/home/kuan/T23-C3-Project/t23_firmware/init/app_main.sh)
+5. [T23 bridge 主程序](/home/kuan/T23-C3-Project/t23_firmware/app/isp_bridge/src/main.c)
+6. [C3 bridge 主程序](/home/kuan/T23-C3-Project/c3_firmware/main/main.c)
+7. [共享协议头](/home/kuan/T23-C3-Project/shared/include/t23_c3_protocol.h)
 
 总指南里现在已经统一包含：
 
@@ -26,11 +26,11 @@
 
 ## 目录说明
 
-- [t23_rebuild](/home/kuan/T23-C3-Project/t23_rebuild)
+- [t23_firmware](/home/kuan/T23-C3-Project/t23_firmware)
   T23 侧应用、启动脚本、打包镜像
-- [c3_rebuild](/home/kuan/T23-C3-Project/c3_rebuild)
+- [c3_firmware](/home/kuan/T23-C3-Project/c3_firmware)
   ESP32-C3 固件、网页服务、WiFi bridge
-- [t23_c3_shared](/home/kuan/T23-C3-Project/t23_c3_shared)
+- [shared](/home/kuan/T23-C3-Project/shared)
   T23 与 C3 共用协议和边框提取数据结构
 - [configs](/home/kuan/T23-C3-Project/configs)
   新旧硬件串口内核配置快照
@@ -42,14 +42,14 @@
 ### T23 打包
 
 ```sh
-cd /home/kuan/T23-C3-Project/t23_rebuild
+cd /home/kuan/T23-C3-Project/t23_firmware
 ./scripts/package_flash_image.sh
 ```
 
 ### C3 刷机
 
 ```sh
-cd /home/kuan/T23-C3-Project/c3_rebuild
+cd /home/kuan/T23-C3-Project/c3_firmware
 source ./scripts/idf_env.sh
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
